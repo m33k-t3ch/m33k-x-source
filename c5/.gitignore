@@ -1,0 +1,7 @@
+.pio/
+.vscode/
+include/m33k_private_config.h
+*.bin
+*.elf
+*.map
+*.zip

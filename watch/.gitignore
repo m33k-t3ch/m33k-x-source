@@ -1,0 +1,13 @@
+.pio/
+.vscode/
+.idea/
+*.bin
+*.elf
+*.map
+*.log
+*.zip
+include/m33k_private_config.h
+**/m33k_private_config.h
+.env
+.env.*
+!.env.example

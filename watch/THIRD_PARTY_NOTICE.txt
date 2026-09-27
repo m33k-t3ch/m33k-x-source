@@ -1,0 +1,10 @@
+M33K Watch v0.3.4
+
+Application/UI code is original M33K Watch project code.
+
+Hardware support: LILYGO LilyGoLib / SensorLib dependencies.
+Wi-Fi: ESP32 Arduino WiFi API.
+NTP/timezone: ESP32 Arduino time APIs.
+Persistence: ESP32 Preferences/NVS.
+
+No WDGWatch source code is included.
