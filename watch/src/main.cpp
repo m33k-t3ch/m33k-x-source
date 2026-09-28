@@ -1,4 +1,11 @@
 #include <Arduino.h>
+
+// Recon/Pulse/Radar process Wi-Fi, BLE and LVGL results on Arduino's loopTask.
+// The ESP32 Arduino default loop stack is 8 KB; measured crashes on hardware
+// hit the loopTask stack canary after the first Recon Pulse/Radar result pass.
+// Give the main task more headroom for those combined scan/render paths.
+SET_LOOP_TASK_STACK_SIZE(16 * 1024);
+
 #include <WiFi.h>
 #include <esp_wifi.h>
 #include <esp_system.h>
@@ -140,12 +147,15 @@ struct WardriveRecord {
 
 struct RadarBlip {
     bool active = false;
+    bool seenThisSweep = false;
+    bool missing = false;
     bool wifi = false;
     bool fromC5 = false;
     String name;
     String id;
     int rssi = -127;
     uint16_t angleDeg = 0;
+    uint32_t lastSeenMs = 0;
     lv_obj_t *dot = nullptr;
 };
 
@@ -430,6 +440,11 @@ lv_obj_t *radarStatusLabel = nullptr;
 lv_obj_t *radarInfoLabel = nullptr;
 lv_obj_t *radarSweepDots[9] = {};
 uint16_t radarSweepAngle = 0;
+constexpr uint32_t RADAR_RESCAN_MS = 4200;
+// Keep a signal visible across refreshes. If it misses a sweep it fades;
+// remove it only after it has not been observed for a while.
+constexpr uint32_t RADAR_STALE_MS = 15000;
+uint32_t radarNextScanMs = 0;
 
 // Recon Pulse: passive Wi-Fi change radar
 constexpr uint8_t PULSE_MAX_APS = 10;
@@ -1710,7 +1725,9 @@ bool startC5DiscoveryAsync()
 
     scan->clearResults();
     scan->setActiveScan(true);
-    scan->setMaxResults(60);
+    // Keep discovery bounded.  A large BLE result cache increases heap use
+    // and stack pressure when finishC5Discovery() walks the results.
+    scan->setMaxResults(24);
     bleScanFinished = false;
 
     c5StatusText = "FINDING M33K X C5";
@@ -1869,15 +1886,30 @@ bool finishC5Discovery()
     return true;
 }
 
+bool startToolC5Discovery()
+{
+    if (c5IsLinked() || c5TransportConnected() || c5DiscoveryInFlight) {
+        return c5DiscoveryInFlight;
+    }
+
+    // A tool page is an explicit request to use dual-band features, so do not
+    // inherit a previous "not found" retry delay from another page.
+    c5NextConnectAttemptMs = 0;
+    return startC5DiscoveryAsync();
+}
+
 bool requestC5Scan()
 {
     if (c5ScanInFlight) return true;
 
-    // Never perform a blocking BLE discovery from an LVGL timer.  If the C5
-    // is absent, queue a short asynchronous discovery and let the watch's
-    // local 2.4 GHz scan continue independently.
+    // Recon/Pulse/Radar timers must never start C5 BLE discovery themselves.
+    // Discovery allocates/iterates a comparatively large NimBLE result set on
+    // loopTask and can exhaust the Arduino loop stack while the recon tools
+    // are also processing Wi-Fi/LVGL work.  If the companion is not already
+    // authenticated, continue safely in local 2.4 GHz-only mode.  C5
+    // discovery remains available from the Wi-Fi page, where it is started
+    // outside the recon scan/timer path.
     if (!c5IsLinked()) {
-        if (!c5TransportConnected()) startC5DiscoveryAsync();
         return false;
     }
 
@@ -3286,6 +3318,13 @@ void wardriveStartEvent(lv_event_t *e)
             lv_label_set_text(
                 wardriveStatusLabel,
                 "FINISHING LAST RADIO SCAN..."
+            );
+        }
+    } else if (c5DiscoveryInFlight) {
+        if (wardriveStatusLabel) {
+            lv_label_set_text(
+                wardriveStatusLabel,
+                "CONNECTING C5  |  TAP START AGAIN"
             );
         }
     } else {
@@ -4740,26 +4779,55 @@ void addRadarBlip(
     int rssi,
     bool fromC5 = false)
 {
-    if (radarBlipCount >= MAX_RADAR_BLIPS) {
+    const uint32_t now = millis();
+
+    // Update an existing signal instead of destroying/recreating it every
+    // refresh. Wi-Fi BSSID / BLE address is the stable identity.
+    for (auto &blip : radarBlips) {
+        if (!blip.active) continue;
+        if (blip.wifi != wifi || blip.id != id) continue;
+
+        blip.seenThisSweep = true;
+        blip.missing = false;
+        blip.fromC5 = fromC5;
+        blip.name =
+            name.length() > 0
+                ? name
+                : String("<unnamed>");
+        blip.rssi = rssi;
+        blip.lastSeenMs = now;
         return;
     }
 
-    RadarBlip &blip =
-        radarBlips[radarBlipCount++];
+    RadarBlip *slot = nullptr;
+    for (auto &blip : radarBlips) {
+        if (!blip.active) {
+            slot = &blip;
+            break;
+        }
+    }
 
-    blip.active = true;
-    blip.wifi = wifi;
-    blip.fromC5 = fromC5;
-    blip.name =
+    if (!slot) {
+        return;
+    }
+
+    *slot = RadarBlip{};
+    slot->active = true;
+    slot->seenThisSweep = true;
+    slot->wifi = wifi;
+    slot->fromC5 = fromC5;
+    slot->name =
         name.length() > 0
             ? name
             : String("<unnamed>");
-    blip.id = id;
-    blip.rssi = rssi;
-    blip.angleDeg =
+    slot->id = id;
+    slot->rssi = rssi;
+    slot->angleDeg =
         static_cast<uint16_t>(
             m33kHashString(id) % 360u
         );
+    slot->lastSeenMs = now;
+    ++radarBlipCount;
 }
 
 void renderRadarBlips()
@@ -4767,12 +4835,8 @@ void renderRadarBlips()
     constexpr int centerX = 205;
     constexpr int centerY = 258;
 
-    for (uint8_t i = 0;
-         i < radarBlipCount;
-         ++i) {
-
-        RadarBlip &blip =
-            radarBlips[i];
+    for (auto &blip : radarBlips) {
+        if (!blip.active) continue;
 
         const int radius =
             rssiToRadarRadius(blip.rssi);
@@ -4794,21 +4858,33 @@ void renderRadarBlips()
                 sinf(rad) * radius
             );
 
-        lv_obj_t *dot =
-            lv_button_create(screen);
+        if (!blip.dot) {
+            blip.dot =
+                lv_button_create(screen);
 
-        blip.dot = dot;
+            lv_obj_remove_style_all(blip.dot);
+            lv_obj_set_size(blip.dot, 24, 24);
+            lv_obj_set_style_bg_opa(blip.dot, LV_OPA_TRANSP, 0);
+            lv_obj_set_style_border_width(blip.dot, 0, 0);
+            lv_obj_set_style_shadow_width(blip.dot, 14, 0);
+            lv_obj_set_style_shadow_spread(blip.dot, 1, 0);
+            lv_obj_set_ext_click_area(blip.dot, 6);
 
-        lv_obj_remove_style_all(dot);
-        lv_obj_set_size(dot, 24, 24);
-        lv_obj_set_pos(dot, x - 12, y - 12);
-        lv_obj_set_style_bg_opa(dot, LV_OPA_TRANSP, 0);
-        lv_obj_set_style_border_width(dot, 0, 0);
-        lv_obj_set_style_shadow_width(dot, 14, 0);
-        lv_obj_set_style_shadow_spread(dot, 1, 0);
-        lv_obj_set_style_shadow_opa(dot, 180, 0);
+            lv_obj_t *skull = lv_image_create(blip.dot);
+            lv_image_set_src(skull, &bunny_skull_graph_img);
+            lv_obj_center(skull);
+
+            lv_obj_add_event_cb(
+                blip.dot,
+                radarBlipEvent,
+                LV_EVENT_CLICKED,
+                &blip
+            );
+        }
+
+        lv_obj_set_pos(blip.dot, x - 12, y - 12);
         lv_obj_set_style_shadow_color(
-            dot,
+            blip.dot,
             lv_color_hex(
                 blip.wifi
                     ? (blip.fromC5 ? 0x2F6BFF : 0x55EEFF)
@@ -4816,17 +4892,15 @@ void renderRadarBlips()
             ),
             0
         );
-        lv_obj_set_ext_click_area(dot, 6);
-
-        lv_obj_t *skull = lv_image_create(dot);
-        lv_image_set_src(skull, &bunny_skull_graph_img);
-        lv_obj_center(skull);
-
-        lv_obj_add_event_cb(
-            dot,
-            radarBlipEvent,
-            LV_EVENT_CLICKED,
-            &blip
+        lv_obj_set_style_shadow_opa(
+            blip.dot,
+            blip.missing ? 70 : 180,
+            0
+        );
+        lv_obj_set_style_opa(
+            blip.dot,
+            blip.missing ? 95 : 255,
+            0
         );
     }
 }
@@ -4894,11 +4968,12 @@ void finishRadarBleScan()
 {
     if (!bleScannerInitialized) {
         radarPhase = RadarPhase::Failed;
+        radarNextScanMs = millis() + RADAR_RESCAN_MS;
 
         if (radarStatusLabel) {
             lv_label_set_text(
                 radarStatusLabel,
-                "BLE RADAR SCAN FAILED"
+                "BLE RADAR SCAN FAILED  |  RETRYING..."
             );
         }
 
@@ -4917,10 +4992,8 @@ void finishRadarBleScan()
     const int maxBle =
         min(count, 6);
 
-    // Rebuild the Wi-Fi half now that the concurrent C5 scan has had the
-    // entire BLE sweep window to finish. This gives first-time Radar opens a
-    // fresh 5 GHz result set instead of requiring a second refresh.
-    clearRadarBlips();
+    // Refresh Wi-Fi entries after the BLE window so a C5 scan that completed
+    // during BLE collection can be included without clearing existing blips.
     mergeC5WifiResults();
     addStrongestMergedWifiRadarBlips();
 
@@ -4950,11 +5023,34 @@ void finishRadarBleScan()
         );
     }
 
+    const uint32_t now = millis();
+    radarBlipCount = 0;
+
+    for (auto &blip : radarBlips) {
+        if (!blip.active) continue;
+
+        if (!blip.seenThisSweep) {
+            blip.missing = true;
+
+            if (now - blip.lastSeenMs >= RADAR_STALE_MS) {
+                if (blip.dot) {
+                    lv_obj_delete(blip.dot);
+                    blip.dot = nullptr;
+                }
+                blip = RadarBlip{};
+                continue;
+            }
+        }
+
+        ++radarBlipCount;
+    }
+
     scan->clearResults();
 
     renderRadarBlips();
 
     radarPhase = RadarPhase::Done;
+    radarNextScanMs = millis() + RADAR_RESCAN_MS;
 
     if (radarStatusLabel) {
         lv_label_set_text_fmt(
@@ -4972,7 +5068,14 @@ void beginRadarScan()
     }
 
     noteActivity();
-    clearRadarBlips();
+
+    // Preserve current blips while a new sweep runs. Each one is marked
+    // unseen and will either be refreshed by this sweep or faded/expired.
+    for (auto &blip : radarBlips) {
+        if (blip.active) {
+            blip.seenThisSweep = false;
+        }
+    }
 
     if (radarInfoLabel) {
         lv_label_set_text(
@@ -5039,11 +5142,12 @@ void beginRadarScan()
 
     if (result == WIFI_SCAN_FAILED) {
         radarPhase = RadarPhase::Failed;
+        radarNextScanMs = millis() + RADAR_RESCAN_MS;
 
         if (radarStatusLabel) {
             lv_label_set_text(
                 radarStatusLabel,
-                "WI-FI RADAR SCAN FAILED"
+                "WI-FI RADAR SCAN FAILED  |  RETRYING..."
             );
         }
 
@@ -5060,6 +5164,7 @@ void radarRefreshEvent(lv_event_t *e)
     if (!clickAllowed()) return;
 
     hapticTap();
+    radarNextScanMs = 0;
     beginRadarScan();
 }
 
@@ -5110,6 +5215,14 @@ void radarTimerCb(lv_timer_t *timer)
         );
     }
 
+    if ((radarPhase == RadarPhase::Done ||
+         radarPhase == RadarPhase::Failed) &&
+        radarNextScanMs != 0 &&
+        millis() >= radarNextScanMs) {
+        beginRadarScan();
+        return;
+    }
+
     if (radarPhase !=
         RadarPhase::WifiScanning) {
 
@@ -5148,11 +5261,12 @@ void radarTimerCb(lv_timer_t *timer)
 
     if (!startRadarBleScan()) {
         radarPhase = RadarPhase::Failed;
+        radarNextScanMs = millis() + RADAR_RESCAN_MS;
 
         if (radarStatusLabel) {
             lv_label_set_text(
                 radarStatusLabel,
-                "BLE RADAR SCAN COULD NOT START"
+                "BLE RADAR SCAN BUSY  |  RETRYING..."
             );
         }
     }
@@ -5338,10 +5452,7 @@ void renderHunterTrackerTargets()
 
         lv_label_set_text(
             none,
-            "No Apple Find My / AirTag-class\n"
-            "advertisements detected.\n\n"
-            "A detected tracker-like signal is not\n"
-            "proof that the device is malicious."
+            "NO TRACKER-LIKE SIGNALS FOUND"
         );
 
         lv_obj_set_width(none, 300);
@@ -6989,6 +7100,12 @@ bool beginPulseSweep()
 
 void finishPulseSweep(int16_t count)
 {
+    Serial.printf(
+        "[M33K PULSE] finish sweep: free stack=%u bytes, wifi=%d\n",
+        static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)),
+        count
+    );
+
     const uint32_t now = millis();
 
     uint8_t newCount = 0;
@@ -7244,6 +7361,7 @@ void showReconPulsePage()
 {
     clearScreen();
     currentPage = Page::ReconPulse;
+    const bool waitingForC5 = startToolC5Discovery();
     createSafeHeaderBack(reconSubBackEvent);
 
     lv_obj_t *title = lv_label_create(screen);
@@ -7575,7 +7693,11 @@ void showReconPulsePage()
         nullptr
     );
 
-    beginPulseSweep();
+    if (!waitingForC5) {
+        beginPulseSweep();
+    } else if (pulseStatusLabel) {
+        lv_label_set_text(pulseStatusLabel, "CONNECTING C5...");
+    }
     noteActivity();
 }
 
@@ -12071,6 +12193,7 @@ void showWatchModePage()
 {
     clearScreen();
     currentPage = Page::WatchMode;
+    const bool waitingForC5 = startToolC5Discovery();
     createSafeHeaderBack(reconSubBackEvent);
 
     lv_obj_t *title = lv_label_create(screen);
@@ -12156,7 +12279,11 @@ void showWatchModePage()
     updateWatchSummaryLabels();
 
     watchTimer = lv_timer_create(watchTimerCb, 120, nullptr);
-    beginWatchSweep();
+    if (!waitingForC5) {
+        beginWatchSweep();
+    } else if (watchStatusLabel) {
+        lv_label_set_text(watchStatusLabel, "CONNECTING C5...");
+    }
     noteActivity();
 }
 
@@ -12165,6 +12292,7 @@ void showWardrivePage()
 {
     clearScreen();
     currentPage = Page::Wardrive;
+    startToolC5Discovery();
     createSafeHeaderBack(reconSubBackEvent);
 
     lv_obj_t *title = lv_label_create(screen);
@@ -12552,6 +12680,9 @@ void showRadarPage()
 {
     clearScreen();
     currentPage = Page::Radar;
+    clearRadarBlips();
+    const bool waitingForC5 = startToolC5Discovery();
+    radarNextScanMs = 0;
 
     createSafeHeaderBack(
         reconSubBackEvent
@@ -12839,7 +12970,11 @@ void showRadarPage()
             nullptr
         );
 
-    beginRadarScan();
+    if (!waitingForC5) {
+        beginRadarScan();
+    } else if (radarStatusLabel) {
+        lv_label_set_text(radarStatusLabel, "CONNECTING C5...");
+    }
     noteActivity();
 }
 
@@ -12849,6 +12984,7 @@ void showSignalHunterPage()
     clearScreen();
     currentPage =
         Page::SignalHunter;
+    startToolC5Discovery();
 
     createSafeHeaderBack(
         reconSubBackEvent
@@ -14211,7 +14347,7 @@ void setup()
     backButtonWasDown =
         digitalRead(M33K_BACK_BUTTON_PIN) == LOW;
 
-    Serial.println("\n[M33K X] v0.6.0g-beta dev (no phone companion) starting...");
+    Serial.println("\n[M33K X] v0.6.0h-beta dev (no phone companion) starting...");
 
     instance.begin(NO_HW_LORA);
     instance.setRotation(M33K_ROTATION);
@@ -14315,6 +14451,21 @@ void loop()
 
         if (c5DiscoveryInFlight) {
             const bool linkedNow = finishC5Discovery();
+
+            // Tool pages wait for the one-time C5 discovery attempt before
+            // starting their own scan cycle, so BLE discovery is not stolen
+            // by Wi-Fi/BLE tool scans.
+            if (currentPage == Page::ReconPulse &&
+                pulsePhase == PulsePhase::Idle) {
+                beginPulseSweep();
+            } else if (currentPage == Page::Radar &&
+                       radarPhase == RadarPhase::Idle) {
+                beginRadarScan();
+            } else if (currentPage == Page::WatchMode &&
+                       watchPhase == WatchPhase::Idle) {
+                beginWatchSweep();
+            }
+
             if (currentPage == Page::WiFi) {
                 if (linkedNow) {
                     // Populate 5 GHz immediately after an explicit C5 link.

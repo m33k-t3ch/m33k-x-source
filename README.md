@@ -18,7 +18,7 @@ Both projects are built with PlatformIO.
 
 Current public firmware:
 
-- M33K X Watch — v0.6.0g public beta
+- M33K X Watch — v0.6.0h public beta
 - M33K X C5 — v0.1.3 public beta
 
 The C5 companion extends the Watch with 5 GHz Wi-Fi scanning and uses per-device Watch?C5 enrollment and authenticated reconnect.
