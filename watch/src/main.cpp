@@ -370,6 +370,12 @@ uint32_t wardriveNextSweepMs = 0;
 uint32_t wardriveLastElapsedSeconds = 0;
 String wardriveWifiKeys[WARD_MAX_WIFI];
 uint8_t wardriveWifiCount = 0;
+
+// Independent session-total tracker. This does not control Wardrive rows,
+// scrolling, record cards, scan caches, or SD logging.
+constexpr uint16_t WARD_TOTAL_WIFI_MAX = 192;
+uint64_t wardriveTotalWifiHashes[WARD_TOTAL_WIFI_MAX] = {};
+uint16_t wardriveTotalWifiCount = 0;
 bool wardriveC5CacheApplied = false;
 uint32_t wardriveAppliedC5Generation = 0;
 String wardriveBleAddrs[WARD_MAX_BLE];
@@ -383,6 +389,10 @@ WardriveRecord wardriveRecords[WARD_MAX_RECORDS];
 uint8_t wardriveRecordCount = 0;
 bool wardriveFeedScrolling = false;
 bool wardriveUiSyncPending = false;
+uint32_t wardriveDetailIgnoreUntilMs = 0;
+bool wardriveDetailOpen = false;
+uint8_t wardriveUiSyncCursor = 0;
+uint32_t wardriveLastDiagMs = 0;
 lv_obj_t *wardriveDetailOverlay = nullptr;
 lv_obj_t *wardriveDetailTitle = nullptr;
 lv_obj_t *wardriveDetailBody = nullptr;
@@ -2350,6 +2360,37 @@ void reconTimerCb(lv_timer_t *timer)
     }
 }
 
+uint64_t wardriveTotalWifiHash(const String &bssid)
+{
+    uint64_t hash = 1469598103934665603ULL;
+
+    for (size_t i = 0; i < bssid.length(); ++i) {
+        char c = bssid[i];
+
+        if (c >= 'a' && c <= 'f') {
+            c = static_cast<char>(c - ('a' - 'A'));
+        }
+
+        hash ^= static_cast<uint8_t>(c);
+        hash *= 1099511628211ULL;
+    }
+
+    return hash;
+}
+
+void wardriveTrackWifiTotal(const String &bssid)
+{
+    const uint64_t hash = wardriveTotalWifiHash(bssid);
+
+    for (uint16_t i = 0; i < wardriveTotalWifiCount; ++i) {
+        if (wardriveTotalWifiHashes[i] == hash) return;
+    }
+
+    if (wardriveTotalWifiCount < WARD_TOTAL_WIFI_MAX) {
+        wardriveTotalWifiHashes[wardriveTotalWifiCount++] = hash;
+    }
+}
+
 bool wardriveHasWifi(const String &key)
 {
     for (uint8_t i = 0; i < wardriveWifiCount; ++i) {
@@ -2388,8 +2429,9 @@ void snapshotWardriveLocation(WardriveRecord &rec)
 
 void updateWardriveRecordLabel(WardriveRecord &rec)
 {
-    if (wardriveFeedScrolling) {
+    if (wardriveFeedScrolling || wardriveDetailOpen) {
         wardriveUiSyncPending = true;
+        wardriveUiSyncCursor = 0;
         return;
     }
     if (!rec.label) return;
@@ -2415,8 +2457,9 @@ void updateWardriveRecordLabel(WardriveRecord &rec)
 
 void createWardriveRecordRow(WardriveRecord &rec)
 {
-    if (wardriveFeedScrolling) {
+    if (wardriveFeedScrolling || wardriveDetailOpen) {
         wardriveUiSyncPending = true;
+        wardriveUiSyncCursor = 0;
         return;
     }
     if (!wardriveFeedScroll || rec.row) return;
@@ -2451,14 +2494,37 @@ void createWardriveRecordRow(WardriveRecord &rec)
 
 void syncWardriveRecordRows()
 {
-    if (wardriveFeedScrolling || !wardriveFeedScroll) return;
-    for (uint8_t i = 0; i < wardriveRecordCount; ++i) {
-        WardriveRecord &rec = wardriveRecords[i];
-        if (!rec.active) continue;
-        if (!rec.row) createWardriveRecordRow(rec);
-        if (rec.label) updateWardriveRecordLabel(rec);
+    if (wardriveFeedScrolling || wardriveDetailOpen || !wardriveFeedScroll) return;
+
+    constexpr uint8_t WARD_UI_ROWS_PER_TICK = 3;
+
+    if (wardriveUiSyncCursor >= wardriveRecordCount) {
+        wardriveUiSyncCursor = 0;
     }
-    wardriveUiSyncPending = false;
+
+    uint8_t processed = 0;
+
+    while (wardriveUiSyncCursor < wardriveRecordCount &&
+           processed < WARD_UI_ROWS_PER_TICK) {
+
+        WardriveRecord &rec =
+            wardriveRecords[wardriveUiSyncCursor++];
+
+        ++processed;
+
+        if (!rec.active) continue;
+
+        if (!rec.row) {
+            createWardriveRecordRow(rec);
+        } else if (rec.label) {
+            updateWardriveRecordLabel(rec);
+        }
+    }
+
+    if (wardriveUiSyncCursor >= wardriveRecordCount) {
+        wardriveUiSyncCursor = 0;
+        wardriveUiSyncPending = false;
+    }
 }
 
 void wardriveFeedScrollEvent(lv_event_t *e)
@@ -2466,11 +2532,14 @@ void wardriveFeedScrollEvent(lv_event_t *e)
     const lv_event_code_t code = lv_event_get_code(e);
     if (code == LV_EVENT_SCROLL_BEGIN) {
         wardriveFeedScrolling = true;
+        wardriveDetailIgnoreUntilMs = millis() + 500;
+        noteActivity();
         return;
     }
     if (code == LV_EVENT_SCROLL_END) {
         wardriveFeedScrolling = false;
-        if (wardriveUiSyncPending) syncWardriveRecordRows();
+        wardriveDetailIgnoreUntilMs = millis() + 500;
+        // Defer row creation/update until the Wardrive timer tick.
         noteActivity();
     }
 }
@@ -2501,20 +2570,48 @@ WardriveRecord *newWardriveRecord(
     rec.firstSeenMs = millis();
     rec.lastSeenMs = rec.firstSeenMs;
     snapshotWardriveLocation(rec);
-    createWardriveRecordRow(rec);
+    wardriveUiSyncPending = true;
+    wardriveUiSyncCursor = 0;
     return &rec;
 }
 
 void wardriveDetailCloseEvent(lv_event_t *e)
 {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    if (wardriveDetailOverlay) lv_obj_add_flag(wardriveDetailOverlay, LV_OBJ_FLAG_HIDDEN);
+
+    wardriveDetailOpen = false;
+
+    if (wardriveDetailOverlay) {
+        lv_obj_add_flag(
+            wardriveDetailOverlay,
+            LV_OBJ_FLAG_HIDDEN
+        );
+    }
+
+    // Background records may have changed while the overlay was open.
+    // Resume them gradually through the existing batched UI sync.
+    wardriveUiSyncPending = true;
+    wardriveUiSyncCursor = 0;
+
+    if (wardriveFeedScroll) {
+        lv_obj_update_layout(wardriveFeedScroll);
+        lv_obj_invalidate(wardriveFeedScroll);
+    }
+
+    if (screen) {
+        lv_obj_invalidate(screen);
+    }
+
     noteActivity();
 }
 
 void wardriveDetailEvent(lv_event_t *e)
 {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED || !clickAllowed()) return;
+    if (wardriveFeedScrolling ||
+        (int32_t)(millis() - wardriveDetailIgnoreUntilMs) < 0) {
+        return;
+    }
     auto *rec = static_cast<WardriveRecord *>(lv_event_get_user_data(e));
     if (!rec || !wardriveDetailOverlay || !wardriveDetailTitle || !wardriveDetailBody) return;
 
@@ -2577,6 +2674,7 @@ void wardriveDetailEvent(lv_event_t *e)
     }
 
     lv_label_set_text(wardriveDetailBody, body.c_str());
+    wardriveDetailOpen = true;
     lv_obj_remove_flag(wardriveDetailOverlay, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(wardriveDetailOverlay);
 }
@@ -2584,6 +2682,7 @@ void wardriveDetailEvent(lv_event_t *e)
 void resetWardriveRecords()
 {
     wardriveFeedScrolling = false;
+    wardriveDetailOpen = false;
     wardriveUiSyncPending = false;
     wardriveRecordCount = 0;
     for (auto &rec : wardriveRecords) rec = WardriveRecord{};
@@ -2922,7 +3021,7 @@ void updateWardriveUi()
     if (currentPage != Page::Wardrive) return;
 
     if (wardriveWifiLabel) {
-        lv_label_set_text_fmt(wardriveWifiLabel, "WI-FI\n%u", (unsigned)wardriveWifiCount);
+        lv_label_set_text_fmt(wardriveWifiLabel, "WI-FI\n%u", (unsigned)wardriveTotalWifiCount);
     }
     if (wardriveBleLabel) {
         lv_label_set_text_fmt(wardriveBleLabel, "BLE\n%u", (unsigned)wardriveBleCount);
@@ -3072,6 +3171,7 @@ void finishWardriveWifiScan()
 
         const String &ssid = detail.ssid;
         const String &bssid = detail.bssid;
+        wardriveTrackWifiTotal(bssid);
         String key = ssid + "|" + bssid;
         if (!wardriveHasWifi(key) && wardriveWifiCount < WARD_MAX_WIFI) {
             wardriveWifiKeys[wardriveWifiCount++] = key;
@@ -3197,8 +3297,50 @@ void wardriveTimerCb(lv_timer_t *timer)
     LV_UNUSED(timer);
     if (currentPage != Page::Wardrive) return;
     serviceC5Link();
+
+    if (!wardriveFeedScrolling && wardriveUiSyncPending) {
+        syncWardriveRecordRows();
+    }
+
     updateWardriveUi();
     if (!wardriveRunning) return;
+
+    if (millis() - wardriveLastDiagMs >= 5000) {
+        wardriveLastDiagMs = millis();
+
+        Serial.printf(
+            "[M33K WARD] heap=%u minHeap=%u stack=%u records=%u C5=%s\n",
+            (unsigned)ESP.getFreeHeap(),
+            (unsigned)ESP.getMinFreeHeap(),
+            (unsigned)uxTaskGetStackHighWaterMark(nullptr),
+            (unsigned)wardriveRecordCount,
+            c5IsLinked() ? "LINKED" : "OFFLINE"
+        );
+    }
+
+    // Allow a C5 powered on after Wardrive starts to join automatically.
+    // Retry only during the quiet gap between Wardrive sweeps.
+    if (wardrivePhase == WardrivePhase::Idle && !c5IsLinked()) {
+        if (!c5TransportConnected() &&
+            !c5DiscoveryInFlight &&
+            millis() >= c5NextConnectAttemptMs) {
+
+            if (startC5DiscoveryAsync()) {
+                if (wardriveStatusLabel) {
+                    lv_label_set_text(
+                        wardriveStatusLabel,
+                        "SESSION LIVE  |  SEARCHING FOR C5..."
+                    );
+                }
+                return;
+            }
+        }
+
+        if (c5DiscoveryInFlight || c5TransportConnected()) {
+            return;
+        }
+    }
+
     if (wardrivePhase == WardrivePhase::WifiScanning) {
         int16_t result = WiFi.scanComplete();
         if (result == WIFI_SCAN_RUNNING) return;
@@ -3211,7 +3353,11 @@ void wardriveTimerCb(lv_timer_t *timer)
 void startWardriveSession()
 {
     wardriveWifiCount = 0;
+    wardriveTotalWifiCount = 0;
     wardriveBleCount = 0;
+    wardriveDetailOpen = false;
+    wardriveUiSyncCursor = 0;
+    wardriveLastDiagMs = 0;
     wardriveC5CacheApplied = false;
     wardriveAppliedC5Generation = c5ScanGeneration;
     resetWardriveRecords();
@@ -3244,82 +3390,41 @@ void stopWardriveSession()
             (millis() - wardriveSessionStartedMs) / 1000;
     }
 
-    // STOP must be instant from the UI thread. NimBLEScan::stop() can block
-    // when an asynchronous scan is active, which previously stalled LVGL and
-    // the hardware Back button. Let in-flight scans finish naturally and
-    // clean them up from the main loop instead.
+    // STOP only ends the Wardrive session. Do not touch the Wi-Fi or NimBLE
+    // scanner here (or from a cleanup poll) because those stacks can still be
+    // completing an asynchronous scan on another task. The in-flight scan is
+    // allowed to finish naturally; generic scan-completion handling will
+    // release BLE results, and the next Wardrive start/navigation path safely
+    // resets Wi-Fi scan state before reuse.
     wardriveRunning = false;
     wardrivePhase = WardrivePhase::Stopped;
-    wardriveStopCleanupPending = true;
+    wardriveStopCleanupPending = false;
     stopWardriveSdLog();
+
+    Serial.printf(
+        "[M33K WARD] STOP: heap=%u, minHeap=%u, stack=%u\n",
+        (unsigned)ESP.getFreeHeap(),
+        (unsigned)ESP.getMinFreeHeap(),
+        (unsigned)uxTaskGetStackHighWaterMark(nullptr)
+    );
 
     if (wardriveStartLabel) lv_label_set_text(wardriveStartLabel, "START");
     if (wardriveStatusLabel) {
         lv_label_set_text(
             wardriveStatusLabel,
-            "SESSION STOPPED  |  FINALIZING RADIO SCAN..."
+            "SESSION STOPPED  |  RESULTS HELD ON SCREEN"
         );
-    }
-    updateWardriveUi();
-}
-
-void serviceWardriveStopCleanup()
-{
-    if (!wardriveStopCleanupPending) return;
-
-    // If the user already left Wardrive, do not touch the shared scanners.
-    // The newly opened tool will take ownership when it needs them.
-    if (currentPage != Page::Wardrive) {
-        wardriveStopCleanupPending = false;
-        return;
-    }
-
-    bool wifiDone = true;
-    const int16_t wifiState = WiFi.scanComplete();
-    if (wifiState == WIFI_SCAN_RUNNING) {
-        wifiDone = false;
-    } else {
-        WiFi.scanDelete();
-    }
-
-    bool bleDone = true;
-    if (bleScannerInitialized) {
-        NimBLEScan *scan = NimBLEDevice::getScan();
-        if (scan->isScanning()) {
-            bleDone = false;
-        } else {
-            scan->clearResults();
-            scan->setMaxResults(MAX_BLE_DETAILS);
-            bleScanFinished = false;
-        }
-    }
-
-    if (wifiDone && bleDone) {
-        wardriveStopCleanupPending = false;
-
-        if (wardriveStatusLabel) {
-            lv_label_set_text(
-                wardriveStatusLabel,
-                "SESSION STOPPED  |  RESULTS HELD ON SCREEN"
-            );
-        }
     }
 }
 
 void wardriveStartEvent(lv_event_t *e)
 {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED || !clickAllowed()) return;
+    
     noteActivity();
     hapticTap();
     if (wardriveRunning) {
         stopWardriveSession();
-    } else if (wardriveStopCleanupPending) {
-        if (wardriveStatusLabel) {
-            lv_label_set_text(
-                wardriveStatusLabel,
-                "FINISHING LAST RADIO SCAN..."
-            );
-        }
     } else if (c5DiscoveryInFlight) {
         if (wardriveStatusLabel) {
             lv_label_set_text(
@@ -3335,6 +3440,7 @@ void wardriveStartEvent(lv_event_t *e)
 void reconWardriveEvent(lv_event_t *e)
 {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED || !clickAllowed()) return;
+    
     noteActivity();
     hapticTap();
     showWardrivePage();
@@ -12324,6 +12430,9 @@ void showWardrivePage()
     lv_obj_set_style_border_width(sessionCard, 1, 0);
     lv_obj_set_style_border_color(sessionCard, lv_color_hex(0x55EEFF), 0);
     lv_obj_set_style_pad_all(sessionCard, 0, 0);
+    lv_obj_clear_flag(sessionCard, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(sessionCard, LV_OBJ_FLAG_SCROLL_CHAIN_VER);
+    lv_obj_clear_flag(sessionCard, LV_OBJ_FLAG_SCROLL_CHAIN_HOR);
 
     wardriveElapsedLabel = lv_label_create(sessionCard);
     lv_label_set_text(wardriveElapsedLabel, "SESSION  00:00");
@@ -12352,7 +12461,10 @@ void showWardrivePage()
     lv_obj_set_style_pad_row(wardriveFeedScroll, 5, 0);
     lv_obj_set_flex_flow(wardriveFeedScroll, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_scroll_dir(wardriveFeedScroll, LV_DIR_VER);
+    lv_obj_add_flag(wardriveFeedScroll, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_clear_flag(wardriveFeedScroll, LV_OBJ_FLAG_SCROLL_ELASTIC);
+    lv_obj_clear_flag(wardriveFeedScroll, LV_OBJ_FLAG_SCROLL_CHAIN_VER);
+    lv_obj_clear_flag(wardriveFeedScroll, LV_OBJ_FLAG_SCROLL_CHAIN_HOR);
     lv_obj_set_scrollbar_mode(wardriveFeedScroll, LV_SCROLLBAR_MODE_ACTIVE);
     lv_obj_add_event_cb(wardriveFeedScroll, wardriveFeedScrollEvent, LV_EVENT_ALL, nullptr);
 
@@ -12446,7 +12558,11 @@ void showWardrivePage()
     lv_obj_center(wardriveDetailCloseText);
 
     wardriveWifiCount = 0;
+    wardriveTotalWifiCount = 0;
     wardriveBleCount = 0;
+    wardriveDetailOpen = false;
+    wardriveUiSyncCursor = 0;
+    wardriveLastDiagMs = 0;
     wardriveRecordCount = 0;
     m33kSdReady = instance.isCardReady();
     for (auto &rec : wardriveRecords) rec = WardriveRecord{};
@@ -14135,6 +14251,7 @@ String m33kWardriveFileList()
 void logsRefreshEvent(lv_event_t *e)
 {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED || !clickAllowed()) return;
+    
     noteActivity();
     hapticTap();
     showLogsPage();
@@ -14347,7 +14464,7 @@ void setup()
     backButtonWasDown =
         digitalRead(M33K_BACK_BUTTON_PIN) == LOW;
 
-    Serial.println("\n[M33K X] v0.6.0h-beta dev (no phone companion) starting...");
+    Serial.println("\n[M33K X] v0.6.0i-beta dev (no phone companion) starting...");
 
     instance.begin(NO_HW_LORA);
     instance.setRotation(M33K_ROTATION);
@@ -14430,7 +14547,6 @@ void loop()
     }
 #endif
 
-    serviceWardriveStopCleanup();
     handleHardwareBackButton();
 
     // Keep GNSS parsing non-blocking. The MIA-M10Q is on Serial1 at 38400.
