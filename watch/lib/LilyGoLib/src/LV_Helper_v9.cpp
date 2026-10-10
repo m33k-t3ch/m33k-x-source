@@ -184,13 +184,22 @@ void beginLvglHelper(LilyGo_Display &board, bool debug)
 
         log_d("Using DMA pushColors..");
 
-        lv_buffer_size = (board.width() * board.height() / 6) * sizeof(lv_color16_t);
+        // M33K X: keep LVGL buffers DMA-capable but smaller.
+        // Two 1/12-screen buffers preserve double buffering while
+        // leaving substantially more internal RAM for Wi-Fi/NimBLE.
+        lv_buffer_size = (board.width() * board.height() / 24) * sizeof(lv_color16_t);
 
         // lv_buffer_size = (board.width() * board.height() / 10) * sizeof(lv_color16_t);
 
-        buf = (lv_color16_t *)heap_caps_malloc(lv_buffer_size, MALLOC_CAP_DMA);
+        buf = (lv_color16_t *)heap_caps_malloc(
+            lv_buffer_size,
+            MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT
+        );
         assert(buf);
-        buf1 = (lv_color16_t *)heap_caps_malloc(lv_buffer_size, MALLOC_CAP_DMA);
+        buf1 = (lv_color16_t *)heap_caps_malloc(
+            lv_buffer_size,
+            MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT
+        );
         assert(buf1);
 
         if (!esp_ptr_dma_capable(buf) || !esp_ptr_dma_capable(buf1)) {

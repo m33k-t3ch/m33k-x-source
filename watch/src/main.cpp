@@ -9,6 +9,7 @@ SET_LOOP_TASK_STACK_SIZE(16 * 1024);
 #include <WiFi.h>
 #include <esp_wifi.h>
 #include <esp_system.h>
+#include <esp_heap_caps.h>
 #include <NimBLEDevice.h>
 #include <Preferences.h>
 #include <SD.h>
@@ -67,9 +68,11 @@ enum class Page : uint8_t {
     Wardrive,
     Radio,
     GPS,
+    Map,
     NFC,
     Logs,
-    Settings
+    Settings,
+    Stopwatch
 };
 
 struct DockItem {
@@ -260,10 +263,21 @@ lv_timer_t *matrixTimer = nullptr;
 lv_timer_t *homeLiveTimer = nullptr;
 lv_timer_t *wifiTimer = nullptr;
 lv_timer_t *gpsTimer = nullptr;
+lv_timer_t *mapTimer = nullptr;
 lv_timer_t *reconTimer = nullptr;
 lv_timer_t *watchTimer = nullptr;
 lv_timer_t *radioTimer = nullptr;
 lv_timer_t *nfcTimer = nullptr;
+
+// Stopwatch
+lv_timer_t *stopwatchTimer = nullptr;
+lv_obj_t *stopwatchTimeLabel = nullptr;
+lv_obj_t *stopwatchStartLabel = nullptr;
+lv_obj_t *stopwatchStatusLabel = nullptr;
+
+bool stopwatchRunning = false;
+uint32_t stopwatchStartedMs = 0;
+uint32_t stopwatchAccumulatedMs = 0;
 
 enum class ReconPhase : uint8_t {
     Idle,
@@ -357,7 +371,11 @@ lv_obj_t *wardriveFeedStateLabel = nullptr;
 lv_obj_t *wardriveStartLabel = nullptr;
 lv_obj_t *wardriveSdLabel = nullptr;
 bool wardriveRunning = false;
+uint32_t wardriveLastStartStopMs = 0;
 bool wardriveStopCleanupPending = false;
+bool wardriveExitToReconPending = false;
+bool wardriveOpenFromReconPending = false;
+bool reconExitHomePending = false;
 
 // SD logging is intentionally optional. A missing/unreadable card must never
 // prevent the Watch, Recon, GPS, Wi-Fi, BLE, or Wardrive tools from running.
@@ -371,28 +389,87 @@ uint32_t wardriveLastElapsedSeconds = 0;
 String wardriveWifiKeys[WARD_MAX_WIFI];
 uint8_t wardriveWifiCount = 0;
 
-// Independent session-total tracker. This does not control Wardrive rows,
-// scrolling, record cards, scan caches, or SD logging.
-constexpr uint16_t WARD_TOTAL_WIFI_MAX = 192;
-uint64_t wardriveTotalWifiHashes[WARD_TOTAL_WIFI_MAX] = {};
-uint16_t wardriveTotalWifiCount = 0;
+// Independent fixed-memory session-total tracker. A Bloom filter avoids the
+// old 192-device ceiling without growing heap usage during long drives.
+constexpr uint16_t WARD_TOTAL_WIFI_BLOOM_BITS = 16384;
+constexpr uint16_t WARD_TOTAL_WIFI_BLOOM_BYTES = WARD_TOTAL_WIFI_BLOOM_BITS / 8;
+uint8_t wardriveTotalWifiBloom[WARD_TOTAL_WIFI_BLOOM_BYTES] = {};
+uint32_t wardriveTotalWifiCount = 0;
+bool wardriveMemoryPaused = false;
+bool wardrivePageActive = false;
+// Wardrive heap guard.
+//
+// Current post-C5 steady-state heap is commonly around 28-30 KB.
+// The previous 28K pause / 32K resume thresholds could latch Wardrive
+// permanently after a healthy C5 transaction or page re-entry.
+//
+// Keep a safety floor, but allow normal post-C5 recovery to resume scans.
+constexpr uint32_t WARD_HEAP_PAUSE_BYTES = 24000U;
+constexpr uint32_t WARD_HEAP_RESUME_BYTES = 27000U;
+constexpr uint32_t WARD_LARGEST_BLOCK_PAUSE_BYTES = 24000U;
+constexpr uint32_t WARD_LARGEST_BLOCK_RESUME_BYTES = 36000U;
 bool wardriveC5CacheApplied = false;
 uint32_t wardriveAppliedC5Generation = 0;
 String wardriveBleAddrs[WARD_MAX_BLE];
 uint8_t wardriveBleCount = 0;
-constexpr uint8_t WARD_MAX_FEED_LINES = 40;
+
+// Full-session BLE unique tracker.
+// wardriveBleAddrs[] remains only a bounded detail cache.
+constexpr uint16_t WARD_TOTAL_BLE_BLOOM_BITS = 16384;
+constexpr uint16_t WARD_TOTAL_BLE_BLOOM_BYTES =
+    WARD_TOTAL_BLE_BLOOM_BITS / 8;
+
+uint8_t wardriveTotalBleBloom[WARD_TOTAL_BLE_BLOOM_BYTES] = {};
+uint32_t wardriveTotalBleCount = 0;
+// Fixed six-row LVGL UI with a larger temporary Wardrive cache.
+// Long-session history will later move to SD-backed storage.
+constexpr uint16_t WARD_MAX_FEED_LINES = 120;
 String wardriveSweepLines[WARD_MAX_FEED_LINES];
-uint8_t wardriveSweepLineCount = 0;
+uint16_t wardriveSweepLineCount = 0;
 bool wardriveFeedDirty = true;
-constexpr uint8_t WARD_MAX_RECORDS = 40;
+
+constexpr uint8_t WARD_FEED_PAGE_ROWS = 6;
+lv_obj_t *wardriveFeedRows[WARD_FEED_PAGE_ROWS] = {};
+lv_obj_t *wardriveFeedPageLabel = nullptr;
+
+// Five lightweight bunny-skull progress markers beside the
+// Wardrive feed paging controls.
+//
+// Each marker is made from one head + two ears.
+// No images, canvases, timers, or dynamic buffers are used.
+constexpr uint8_t WARD_BUNNY_PROGRESS_COUNT = 5;
+lv_obj_t *wardriveBunnyHeads[WARD_BUNNY_PROGRESS_COUNT] = {};
+lv_obj_t *wardriveBunnyEarL[WARD_BUNNY_PROGRESS_COUNT] = {};
+lv_obj_t *wardriveBunnyEarR[WARD_BUNNY_PROGRESS_COUNT] = {};
+uint32_t wardriveFeedPageStart = 0;
+bool wardriveFeedFollowLatest = true;
+
+// SD-backed Wardrive feed.
+// Six LVGL rows stay fixed; older entries can be read directly from SD.
+constexpr size_t WARD_FEED_RECORD_BYTES = 32;
+String wardriveFeedPath;
+uint32_t wardriveFeedStoredCount = 0;
+
+// Fixed-memory unique-device tracker for the SD feed.
+constexpr uint16_t WARD_FEED_BLOOM_BITS = 16384;
+constexpr uint16_t WARD_FEED_BLOOM_BYTES =
+    WARD_FEED_BLOOM_BITS / 8;
+uint8_t wardriveFeedBloom[WARD_FEED_BLOOM_BYTES] = {};
+
+// Keep this moderate: WardriveRecord contains Strings.
+constexpr uint16_t WARD_MAX_RECORDS = 96;
 WardriveRecord wardriveRecords[WARD_MAX_RECORDS];
-uint8_t wardriveRecordCount = 0;
+uint16_t wardriveRecordCount = 0;
 bool wardriveFeedScrolling = false;
 bool wardriveUiSyncPending = false;
 uint32_t wardriveDetailIgnoreUntilMs = 0;
 bool wardriveDetailOpen = false;
 uint8_t wardriveUiSyncCursor = 0;
 uint32_t wardriveLastDiagMs = 0;
+
+// Hold display updates briefly after NimBLE work completes.
+uint32_t wardriveDisplayResumeMs = 0;
+
 lv_obj_t *wardriveDetailOverlay = nullptr;
 lv_obj_t *wardriveDetailTitle = nullptr;
 lv_obj_t *wardriveDetailBody = nullptr;
@@ -550,6 +627,66 @@ lv_obj_t *gpsCourseLabel = nullptr;
 lv_obj_t *gpsUtcLabel = nullptr;
 lv_obj_t *gpsDataLabel = nullptr;
 
+// Offline map page shell. The GNSS parser remains shared with the existing
+// GPS page; the map never opens a second UART/GPS session.
+lv_obj_t *mapStatusLabel = nullptr;
+lv_obj_t *mapCoordLabel = nullptr;
+lv_obj_t *mapZoomLabel = nullptr;
+lv_obj_t *mapSdLabel = nullptr;
+lv_obj_t *mapMarkerLabel = nullptr;
+lv_obj_t *mapMarkerDot = nullptr;
+lv_obj_t *mapViewport = nullptr;
+lv_obj_t *mapTileCanvas = nullptr;
+lv_obj_t *mapTilePlaceholder = nullptr;
+constexpr uint8_t MAP_VECTOR_LABEL_COUNT = 10;
+lv_obj_t *mapVectorLabels[MAP_VECTOR_LABEL_COUNT] = {};
+String mapVectorLabelText[MAP_VECTOR_LABEL_COUNT];
+int16_t mapVectorLabelX[MAP_VECTOR_LABEL_COUNT] = {};
+int16_t mapVectorLabelY[MAP_VECTOR_LABEL_COUNT] = {};
+uint8_t mapVectorLabelPriority[MAP_VECTOR_LABEL_COUNT] = {};
+lv_obj_t *mapGridVertical[7] = {};
+lv_obj_t *mapGridHorizontal[7] = {};
+
+constexpr uint16_t MAP_TILE_SIZE = 256;
+constexpr size_t MAP_TILE_BYTES =
+    static_cast<size_t>(MAP_TILE_SIZE) * MAP_TILE_SIZE * 2U;
+constexpr uint16_t MAP_VIEW_WIDTH = 350;
+constexpr uint16_t MAP_VIEW_HEIGHT = 292;
+constexpr size_t MAP_VIEW_BYTES =
+    static_cast<size_t>(MAP_VIEW_WIDTH) * MAP_VIEW_HEIGHT * 2U;
+constexpr int MAP_RELOAD_PIXEL_THRESHOLD = 16;
+constexpr const char *MAP_VECTOR_PROTOTYPE_PATH =
+    "/M33KX/VECTOR/prototype.m33kv";
+constexpr uint8_t MAP_VECTOR_V2_CHUNK_ZOOM = 12;
+constexpr const char *MAP_VECTOR_V2_ROOT =
+    "/M33KX/VECTOR2";
+
+uint8_t *mapTileBuffer = nullptr;
+int32_t mapLoadedTileX = -1;
+int32_t mapLoadedTileY = -1;
+int8_t mapLoadedTileZ = -1;
+int32_t mapRequestedTileX = -1;
+int32_t mapRequestedTileY = -1;
+int8_t mapRequestedTileZ = -1;
+int32_t mapLoadedWorldX = -1;
+int32_t mapLoadedWorldY = -1;
+int32_t mapRequestedWorldX = -1;
+int32_t mapRequestedWorldY = -1;
+double mapRequestedLat = 0.0;
+double mapRequestedLon = 0.0;
+bool mapTileReloadPending = false;
+bool mapTileLoaded = false;
+
+// Private development fallback so offline tile loading can be tested indoors.
+// A real fresh GPS fix always overrides this. Remove before public release.
+constexpr bool MAP_DEV_TEST_LOCATION_ENABLED = true;
+constexpr double MAP_DEV_TEST_LAT = 47.6205;
+constexpr double MAP_DEV_TEST_LON = -122.3493;
+
+uint8_t mapZoomLevel = 16;
+bool mapOpenPending = false;
+bool mapBackToGpsPending = false;
+
 // ST25R3916 NFC-A reader. The RF field is powered only while the NFC page is
 // open; detections are serviced by the LVGL timer on the main UI thread.
 lv_obj_t *nfcStatusLabel = nullptr;
@@ -605,6 +742,15 @@ lv_obj_t *wifiGraphContainer = nullptr;
 lv_obj_t *wifiGraphLegend = nullptr;
 bool wifiGraphView = false;
 bool wifiSubpageTransition = false;
+
+enum class WifiPendingNav : uint8_t {
+    None,
+    OpenGraph,
+    BackToScanner,
+    ExitHome
+};
+
+WifiPendingNav wifiPendingNav = WifiPendingNav::None;
 bool wifiScanning = false;
 uint32_t wifiLastCompleteMs = 0;
 
@@ -668,7 +814,7 @@ bool c5DiscoveryInFlight = false;
 bool c5DiscoveryRequestedByWifi = false;
 bool wifiInitialC5LinkPending = false;
 uint32_t c5DiscoveryStartedMs = 0;
-constexpr uint32_t C5_DISCOVERY_DURATION_MS = 900;
+constexpr uint32_t C5_DISCOVERY_DURATION_MS = 3000;
 constexpr uint32_t C5_DISCOVERY_RETRY_MS = 12000;
 String c5StatusText = "OFFLINE";
 NimBLEClient *c5Client = nullptr;
@@ -798,6 +944,31 @@ void showLogsPage();
 void showRadioPage();
 void showNfcPage();
 void stopWatchTool();
+
+// ------------------------------------------------------------
+// Wardrive radio time-sharing.
+//
+// Keep GPS + local 2.4 GHz running normally.
+//
+// C5:
+//   connect -> one 5 GHz sweep -> consume -> disconnect
+//
+// Watch BLE:
+//   short sample only while C5 transport is idle
+//
+// This prevents the live C5 NimBLE connection from starving the
+// display's internal DMA-capable memory.
+// ------------------------------------------------------------
+bool wardriveC5CycleActive = false;
+uint32_t wardriveC5CycleStartedMs = 0;
+uint32_t wardriveC5RequestGeneration = 0;
+uint32_t wardriveNextC5CycleMs = 0;
+uint32_t wardriveNextBleSampleMs = 0;
+
+constexpr uint32_t WARD_C5_INTERVAL_MS = 30000UL;
+constexpr uint32_t WARD_C5_TIMEOUT_MS = 18000UL;
+constexpr uint32_t WARD_BLE_INTERVAL_MS = 18000UL;
+
 void stopWardriveTool();
 void stopRadioTool();
 void stopNfcTool();
@@ -815,6 +986,7 @@ void wardriveDetailEvent(lv_event_t *e);
 void wardriveDetailCloseEvent(lv_event_t *e);
 void wardriveFeedScrollEvent(lv_event_t *e);
 void syncWardriveRecordRows();
+void initWardriveRecordRows();
 
 // Used by Watch Mode before the detector function body appears later.
 bool isAppleFindMyTrackerLike(const NimBLEAdvertisedDevice *dev);
@@ -912,11 +1084,62 @@ bool clickAllowed()
 
 void sleepScreen()
 {
+    // --------------------------------------------------------
+    // Wardrive background capture mode
+    //
+    // A running Wardrive session must survive the display
+    // timeout. Blank only the backlight and keep the MCU,
+    // Wi-Fi, BLE, GPS, C5 scheduler, SD logger, and Wardrive
+    // timer alive.
+    // --------------------------------------------------------
+    if (currentPage == Page::Wardrive &&
+        wardrivePageActive &&
+        wardriveRunning) {
+
+        screenSleeping = true;
+
+        // No visible rendering is needed while the backlight
+        // is off. Other non-Wardrive home animation timers may
+        // remain paused normally.
+        if (matrixTimer) {
+            lv_timer_pause(matrixTimer);
+        }
+
+        if (homeLiveTimer) {
+            lv_timer_pause(homeLiveTimer);
+        }
+
+        // Backlight off only. Do NOT enter board/system sleep.
+        instance.setBrightness(0);
+
+        wardriveUiSyncPending = true;
+
+        Serial.println(
+            "[M33K WARD] display off; background capture remains active"
+        );
+
+        return;
+    }
+
     if (screenSleeping) return;
 
     screenSleeping = true;
     if (matrixTimer) lv_timer_pause(matrixTimer);
     if (homeLiveTimer) lv_timer_pause(homeLiveTimer);
+
+    if (currentPage == Page::Home) {
+        // Keep GNSS powered continuously. Power-cycling the GNSS rail on
+        // screen sleep caused fresh-acquisition delays and loss of satellite
+        // lock in otherwise stable locations.
+        gpsToolActive = true;
+
+        if (!wifiStayConnected) {
+            WiFi.disconnect(false, false);
+            WiFi.mode(WIFI_OFF);
+        }
+
+        Serial.println("[M33K POWER] Home idle: GNSS kept on, unused Wi-Fi off");
+    }
 
     instance.sleepDisplay();
     Serial.println("[M33K] Display timeout");
@@ -934,6 +1157,9 @@ void wakeScreen()
 
     // First touch only wakes the watch instead of also opening a tool.
     ignoreClicksUntil = millis() + 350;
+
+    // GNSS remains powered while the display sleeps, so no receiver restart
+    // is needed on wake. This preserves warm/hot satellite acquisition state.
 
     if (matrixTimer) lv_timer_resume(matrixTimer);
     if (homeLiveTimer) {
@@ -1681,11 +1907,35 @@ void serviceC5Events()
                 c5ScanComplete = false;
                 c5DiscoveryInFlight = false;
 
+                // If Wardrive froze visual updates during this C5
+                // transaction, redraw once the BLE transport is gone.
+                if (currentPage == Page::Wardrive) {
+                    wardriveUiSyncPending = true;
+                }
+
                 const bool hadRemoteData =
                     c5WifiDetailCount > 0 || c5WifiPendingDetailCount > 0;
                 c5WifiDetailCount = 0;
                 c5WifiPendingDetailCount = 0;
                 if (hadRemoteData) ++c5ScanGeneration;
+
+                // Fully release the disconnected C5 GATT client.
+                if (c5Client && !c5Client->isConnected()) {
+                    NimBLEDevice::deleteClient(c5Client);
+                    c5Client = nullptr;
+
+                    Serial.println(
+                        "[M33K C5] hard client cleanup complete"
+                    );
+                }
+
+                // Let BLE teardown settle before Wardrive redraws.
+                if (currentPage == Page::Wardrive) {
+                    wardriveDisplayResumeMs =
+                        millis() + 1500UL;
+                    wardriveUiSyncPending = true;
+                }
+
 
                 c5StatusText = "OFFLINE";
                 c5NextConnectAttemptMs = millis() + 2500;
@@ -1789,7 +2039,36 @@ bool finishC5Discovery()
         scan->clearResults();
         scan->setMaxResults(MAX_BLE_DETAILS);
         c5StatusText = "C5 NOT FOUND";
-        Serial.println("[M33K C5] M33K X C5 not found (async)");
+
+        // C5 is optional in Wardrive.
+        //
+        // A failed C5 discovery must not immediately monopolize NimBLE
+        // again. Give the watch-side BLE scanner the next quiet radio
+        // window, then retry the optional C5 later.
+        c5NextConnectAttemptMs =
+            millis() + 15000UL;
+
+        if (currentPage == Page::Wardrive &&
+            wardriveRunning) {
+
+            wardriveNextC5CycleMs =
+                millis() + 15000UL;
+
+            wardriveNextBleSampleMs =
+                millis() + 300UL;
+        }
+
+        Serial.println(
+            "[M33K C5] M33K X C5 not found (async)"
+        );
+
+        if (currentPage == Page::Wardrive &&
+            wardriveRunning) {
+            Serial.println(
+                "[M33K WARD] C5 offline; BLE gets next radio window"
+            );
+        }
+
         return false;
     }
 
@@ -2381,13 +2660,82 @@ uint64_t wardriveTotalWifiHash(const String &bssid)
 void wardriveTrackWifiTotal(const String &bssid)
 {
     const uint64_t hash = wardriveTotalWifiHash(bssid);
+    constexpr uint16_t mask = WARD_TOTAL_WIFI_BLOOM_BITS - 1;
 
-    for (uint16_t i = 0; i < wardriveTotalWifiCount; ++i) {
-        if (wardriveTotalWifiHashes[i] == hash) return;
+    const uint16_t bit1 = static_cast<uint16_t>(hash) & mask;
+    const uint16_t bit2 = static_cast<uint16_t>((hash >> 21) ^ hash) & mask;
+    const uint16_t bit3 = static_cast<uint16_t>((hash >> 42) ^ (hash >> 7)) & mask;
+
+    auto bitIsSet = [](uint16_t bit) {
+        return (wardriveTotalWifiBloom[bit >> 3] & (1U << (bit & 7))) != 0;
+    };
+    auto setBit = [](uint16_t bit) {
+        wardriveTotalWifiBloom[bit >> 3] |= static_cast<uint8_t>(1U << (bit & 7));
+    };
+
+    const bool probablySeen =
+        bitIsSet(bit1) && bitIsSet(bit2) && bitIsSet(bit3);
+
+    setBit(bit1);
+    setBit(bit2);
+    setBit(bit3);
+
+    if (!probablySeen && wardriveTotalWifiCount < UINT32_MAX) {
+        ++wardriveTotalWifiCount;
     }
+}
 
-    if (wardriveTotalWifiCount < WARD_TOTAL_WIFI_MAX) {
-        wardriveTotalWifiHashes[wardriveTotalWifiCount++] = hash;
+
+void wardriveTrackBleTotal(const String &addr)
+{
+    if (addr.length() == 0) return;
+
+    const uint64_t hash =
+        wardriveTotalWifiHash(addr);
+
+    constexpr uint16_t mask =
+        WARD_TOTAL_BLE_BLOOM_BITS - 1;
+
+    const uint16_t bit1 =
+        static_cast<uint16_t>(hash) & mask;
+
+    const uint16_t bit2 =
+        static_cast<uint16_t>(
+            (hash >> 21) ^ hash
+        ) & mask;
+
+    const uint16_t bit3 =
+        static_cast<uint16_t>(
+            (hash >> 42) ^ (hash >> 7)
+        ) & mask;
+
+    auto bitIsSet = [](uint16_t bit) {
+        return (
+            wardriveTotalBleBloom[bit >> 3] &
+            (1U << (bit & 7))
+        ) != 0;
+    };
+
+    auto setBit = [](uint16_t bit) {
+        wardriveTotalBleBloom[bit >> 3] |=
+            static_cast<uint8_t>(
+                1U << (bit & 7)
+            );
+    };
+
+    const bool probablySeen =
+        bitIsSet(bit1) &&
+        bitIsSet(bit2) &&
+        bitIsSet(bit3);
+
+    setBit(bit1);
+    setBit(bit2);
+    setBit(bit3);
+
+    if (!probablySeen &&
+        wardriveTotalBleCount < UINT32_MAX) {
+
+        ++wardriveTotalBleCount;
     }
 }
 
@@ -2409,7 +2757,7 @@ bool wardriveHasBle(const String &addr)
 
 WardriveRecord *findWardriveRecord(bool wifi, const String &id)
 {
-    for (uint8_t i = 0; i < wardriveRecordCount; ++i) {
+    for (uint16_t i = 0; i < wardriveRecordCount; ++i) {
         WardriveRecord &rec = wardriveRecords[i];
         if (rec.active && rec.wifi == wifi && rec.id == id) return &rec;
     }
@@ -2429,12 +2777,27 @@ void snapshotWardriveLocation(WardriveRecord &rec)
 
 void updateWardriveRecordLabel(WardriveRecord &rec)
 {
+    if (!wardrivePageActive || currentPage != Page::Wardrive) return;
     if (wardriveFeedScrolling || wardriveDetailOpen) {
         wardriveUiSyncPending = true;
         wardriveUiSyncCursor = 0;
         return;
     }
     if (!rec.label) return;
+
+    if (rec.row) {
+        lv_obj_set_style_bg_color(
+            rec.row,
+            lv_color_hex(rec.wifi ? (rec.fromC5 ? 0x08112A : 0x071C29) : 0x1A0B1B),
+            0
+        );
+        lv_obj_set_style_border_color(
+            rec.row,
+            lv_color_hex(rec.wifi ? (rec.fromC5 ? 0x2F6BFF : 0x55EEFF) : 0xFF52C8),
+            0
+        );
+    }
+
     String displayName = rec.name.length() ? rec.name : rec.id;
     if (displayName.length() > 17) displayName = displayName.substring(0, 14) + "...";
 
@@ -2457,74 +2820,20 @@ void updateWardriveRecordLabel(WardriveRecord &rec)
 
 void createWardriveRecordRow(WardriveRecord &rec)
 {
-    if (wardriveFeedScrolling || wardriveDetailOpen) {
-        wardriveUiSyncPending = true;
-        wardriveUiSyncCursor = 0;
-        return;
-    }
-    if (!wardriveFeedScroll || rec.row) return;
+    LV_UNUSED(rec);
+}
 
-    rec.row = lv_button_create(wardriveFeedScroll);
-    lv_obj_set_width(rec.row, 204);
-    lv_obj_set_height(rec.row, 48);
-    lv_obj_set_style_radius(rec.row, 10, 0);
-    lv_obj_set_style_bg_color(
-        rec.row,
-        lv_color_hex(rec.wifi ? (rec.fromC5 ? 0x08112A : 0x071C29) : 0x1A0B1B),
-        0
-    );
-    lv_obj_set_style_bg_opa(rec.row, 220, 0);
-    lv_obj_set_style_border_width(rec.row, 1, 0);
-    lv_obj_set_style_border_color(
-        rec.row,
-        lv_color_hex(rec.wifi ? (rec.fromC5 ? 0x2F6BFF : 0x55EEFF) : 0xFF52C8),
-        0
-    );
-    lv_obj_set_style_pad_all(rec.row, 4, 0);
-    lv_obj_add_event_cb(rec.row, wardriveDetailEvent, LV_EVENT_CLICKED, &rec);
-
-    rec.label = lv_label_create(rec.row);
-    lv_obj_set_width(rec.label, 194);
-    lv_label_set_long_mode(rec.label, LV_LABEL_LONG_CLIP);
-    lv_obj_set_style_text_color(rec.label, lv_color_hex(0xF4F6FF), 0);
-    lv_obj_set_style_text_font(rec.label, &lv_font_montserrat_12, 0);
-    lv_obj_set_pos(rec.label, 2, 2);
-    updateWardriveRecordLabel(rec);
+void initWardriveRecordRows()
+{
+    // Intentionally disabled. Wardrive uses one bounded scrolling text label
+    // for the live feed. This avoids dynamic/reflowing LVGL child rows during
+    // scans and touch scrolling.
 }
 
 void syncWardriveRecordRows()
 {
-    if (wardriveFeedScrolling || wardriveDetailOpen || !wardriveFeedScroll) return;
-
-    constexpr uint8_t WARD_UI_ROWS_PER_TICK = 3;
-
-    if (wardriveUiSyncCursor >= wardriveRecordCount) {
-        wardriveUiSyncCursor = 0;
-    }
-
-    uint8_t processed = 0;
-
-    while (wardriveUiSyncCursor < wardriveRecordCount &&
-           processed < WARD_UI_ROWS_PER_TICK) {
-
-        WardriveRecord &rec =
-            wardriveRecords[wardriveUiSyncCursor++];
-
-        ++processed;
-
-        if (!rec.active) continue;
-
-        if (!rec.row) {
-            createWardriveRecordRow(rec);
-        } else if (rec.label) {
-            updateWardriveRecordLabel(rec);
-        }
-    }
-
-    if (wardriveUiSyncCursor >= wardriveRecordCount) {
-        wardriveUiSyncCursor = 0;
-        wardriveUiSyncPending = false;
-    }
+    wardriveUiSyncPending = false;
+    wardriveUiSyncCursor = 0;
 }
 
 void wardriveFeedScrollEvent(lv_event_t *e)
@@ -2532,13 +2841,13 @@ void wardriveFeedScrollEvent(lv_event_t *e)
     const lv_event_code_t code = lv_event_get_code(e);
     if (code == LV_EVENT_SCROLL_BEGIN) {
         wardriveFeedScrolling = true;
-        wardriveDetailIgnoreUntilMs = millis() + 500;
+        wardriveDetailIgnoreUntilMs = millis() + 900;
         noteActivity();
         return;
     }
     if (code == LV_EVENT_SCROLL_END) {
         wardriveFeedScrolling = false;
-        wardriveDetailIgnoreUntilMs = millis() + 500;
+        wardriveDetailIgnoreUntilMs = millis() + 900;
         // Defer row creation/update until the Wardrive timer tick.
         noteActivity();
     }
@@ -2550,15 +2859,14 @@ WardriveRecord *newWardriveRecord(
     const String &id,
     bool fromC5 = false)
 {
+    if (!wardrivePageActive || currentPage != Page::Wardrive) return nullptr;
     if (wardriveRecordCount >= WARD_MAX_RECORDS) return nullptr;
-    if (ESP.getFreeHeap() < 45000U) {
-        wardriveUiSyncPending = true;
+
+    if (ESP.getFreeHeap() < WARD_HEAP_PAUSE_BYTES) {
+        wardriveMemoryPaused = true;
         return nullptr;
     }
-    if (wardriveRecordCount == 0 && wardriveFeedLabel) {
-        lv_obj_delete(wardriveFeedLabel);
-        wardriveFeedLabel = nullptr;
-    }
+
     WardriveRecord &rec = wardriveRecords[wardriveRecordCount++];
     rec = WardriveRecord{};
     rec.active = true;
@@ -2570,13 +2878,12 @@ WardriveRecord *newWardriveRecord(
     rec.firstSeenMs = millis();
     rec.lastSeenMs = rec.firstSeenMs;
     snapshotWardriveLocation(rec);
-    wardriveUiSyncPending = true;
-    wardriveUiSyncCursor = 0;
     return &rec;
 }
 
 void wardriveDetailCloseEvent(lv_event_t *e)
 {
+    if (!wardrivePageActive || currentPage != Page::Wardrive) return;
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
 
     wardriveDetailOpen = false;
@@ -2607,7 +2914,8 @@ void wardriveDetailCloseEvent(lv_event_t *e)
 
 void wardriveDetailEvent(lv_event_t *e)
 {
-    if (lv_event_get_code(e) != LV_EVENT_CLICKED || !clickAllowed()) return;
+    if (!wardrivePageActive || currentPage != Page::Wardrive) return;
+    if (lv_event_get_code(e) != LV_EVENT_SHORT_CLICKED || !clickAllowed()) return;
     if (wardriveFeedScrolling ||
         (int32_t)(millis() - wardriveDetailIgnoreUntilMs) < 0) {
         return;
@@ -2684,66 +2992,580 @@ void resetWardriveRecords()
     wardriveFeedScrolling = false;
     wardriveDetailOpen = false;
     wardriveUiSyncPending = false;
+    wardriveUiSyncCursor = 0;
     wardriveRecordCount = 0;
-    for (auto &rec : wardriveRecords) rec = WardriveRecord{};
-    if (wardriveFeedScroll) {
-        lv_obj_clean(wardriveFeedScroll);
-        wardriveFeedLabel = lv_label_create(wardriveFeedScroll);
-        lv_label_set_text(wardriveFeedLabel, "Scanning results will stay here.\nTap a device for details.");
-        lv_obj_set_width(wardriveFeedLabel, 200);
-        lv_label_set_long_mode(wardriveFeedLabel, LV_LABEL_LONG_WRAP);
-        lv_obj_set_style_text_color(wardriveFeedLabel, lv_color_hex(0xF4F6FF), 0);
-        lv_obj_set_style_text_font(wardriveFeedLabel, &lv_font_montserrat_12, 0);
+
+    for (auto &rec : wardriveRecords) {
+        rec = WardriveRecord{};
     }
+
+    wardriveFeedPageStart = 0;
+    wardriveFeedFollowLatest = true;
 }
+
+uint32_t wardriveFeedHash(
+    const String &value,
+    uint32_t seed)
+{
+    uint32_t hash = seed;
+
+    for (size_t i = 0; i < value.length(); ++i) {
+        hash ^= static_cast<uint8_t>(value[i]);
+        hash *= 16777619UL;
+    }
+
+    hash ^= hash >> 16;
+    hash *= 0x7FEB352DUL;
+    hash ^= hash >> 15;
+
+    return hash;
+}
+
+bool wardriveFeedMarkUnique(
+    bool wifi,
+    const String &id)
+{
+    if (id.length() == 0) return false;
+
+    String key;
+    key.reserve(id.length() + 2);
+    key += wifi ? "W|" : "B|";
+    key += id;
+
+    const uint32_t h1 =
+        wardriveFeedHash(
+            key,
+            2166136261UL
+        );
+
+    const uint32_t h2 =
+        wardriveFeedHash(
+            key,
+            0x9E3779B9UL
+        );
+
+    const uint16_t bit1 =
+        static_cast<uint16_t>(
+            h1 % WARD_FEED_BLOOM_BITS
+        );
+
+    const uint16_t bit2 =
+        static_cast<uint16_t>(
+            h2 % WARD_FEED_BLOOM_BITS
+        );
+
+    const uint16_t byte1 = bit1 >> 3;
+    const uint16_t byte2 = bit2 >> 3;
+
+    const uint8_t mask1 =
+        static_cast<uint8_t>(
+            1U << (bit1 & 7U)
+        );
+
+    const uint8_t mask2 =
+        static_cast<uint8_t>(
+            1U << (bit2 & 7U)
+        );
+
+    const bool alreadySeen =
+        (wardriveFeedBloom[byte1] & mask1) &&
+        (wardriveFeedBloom[byte2] & mask2);
+
+    wardriveFeedBloom[byte1] |= mask1;
+    wardriveFeedBloom[byte2] |= mask2;
+
+    return !alreadySeen;
+}
+
+String wardriveMakeFeedPath()
+{
+    if (wardriveLogPath.length() == 0) {
+        return "";
+    }
+
+    String path = wardriveLogPath;
+
+    if (path.endsWith(".csv")) {
+        path.remove(path.length() - 4);
+    }
+
+    path += ".feed";
+    return path;
+}
+
+bool wardriveAppendFeedRecord(
+    const String &line)
+{
+    if (!wardriveSdLogging ||
+        !m33kSdReady ||
+        wardriveLogPath.length() == 0) {
+        return false;
+    }
+
+    if (wardriveFeedPath.length() == 0) {
+        wardriveFeedPath =
+            wardriveMakeFeedPath();
+    }
+
+    if (wardriveFeedPath.length() == 0) {
+        return false;
+    }
+
+    if (!instance.lockSPI(
+            pdMS_TO_TICKS(100))) {
+        return false;
+    }
+
+    File file = SD.open(
+        wardriveFeedPath.c_str(),
+        FILE_APPEND
+    );
+
+    if (!file) {
+        instance.unlockSPI();
+        return false;
+    }
+
+    char record[WARD_FEED_RECORD_BYTES] = {};
+
+    String clipped = line;
+
+    if (clipped.length() >=
+        WARD_FEED_RECORD_BYTES) {
+
+        clipped = clipped.substring(
+            0,
+            WARD_FEED_RECORD_BYTES - 1
+        );
+    }
+
+    memcpy(
+        record,
+        clipped.c_str(),
+        clipped.length()
+    );
+
+    const size_t written =
+        file.write(
+            reinterpret_cast<const uint8_t *>(record),
+            sizeof(record)
+        );
+
+    file.close();
+    instance.unlockSPI();
+
+    if (written != sizeof(record)) {
+        return false;
+    }
+
+    ++wardriveFeedStoredCount;
+    return true;
+}
+
+bool wardriveReadFeedRecord(
+    uint32_t index,
+    String &out)
+{
+    out = "";
+
+    if (!m33kSdReady ||
+        wardriveFeedPath.length() == 0 ||
+        index >= wardriveFeedStoredCount) {
+        return false;
+    }
+
+    if (!instance.lockSPI(
+            pdMS_TO_TICKS(100))) {
+        return false;
+    }
+
+    File file = SD.open(
+        wardriveFeedPath.c_str(),
+        FILE_READ
+    );
+
+    if (!file) {
+        instance.unlockSPI();
+        return false;
+    }
+
+    const uint32_t offset =
+        index *
+        static_cast<uint32_t>(
+            WARD_FEED_RECORD_BYTES
+        );
+
+    if (!file.seek(offset)) {
+        file.close();
+        instance.unlockSPI();
+        return false;
+    }
+
+    char record[
+        WARD_FEED_RECORD_BYTES + 1
+    ] = {};
+
+    const size_t got =
+        file.read(
+            reinterpret_cast<uint8_t *>(
+                record
+            ),
+            WARD_FEED_RECORD_BYTES
+        );
+
+    file.close();
+    instance.unlockSPI();
+
+    if (got != WARD_FEED_RECORD_BYTES) {
+        return false;
+    }
+
+    record[WARD_FEED_RECORD_BYTES] = '\0';
+    out = String(record);
+
+    return true;
+}
+
 
 void wardriveResetSweepFeed()
 {
     wardriveSweepLineCount = 0;
-    for (auto &line : wardriveSweepLines) line = "";
+    wardriveFeedPageStart = 0;
+    wardriveFeedFollowLatest = true;
+
+    wardriveFeedStoredCount = 0;
+    wardriveFeedPath = "";
+
+    memset(
+        wardriveFeedBloom,
+        0,
+        sizeof(wardriveFeedBloom)
+    );
+
+    for (auto &line : wardriveSweepLines) {
+        line = "";
+    }
 }
 
 void wardriveAddSweepLine(const String &line)
 {
     if (line.length() == 0) return;
 
-    if (wardriveSweepLineCount >= WARD_MAX_FEED_LINES) {
-        for (uint8_t i = 1; i < WARD_MAX_FEED_LINES; ++i) {
-            wardriveSweepLines[i - 1] = wardriveSweepLines[i];
+    // Never allow scan-controlled SSID/BLE text to alter LVGL row geometry.
+    // Replace newlines, tabs and control bytes with spaces.
+    String displayLine;
+    displayLine.reserve(32);
+
+    for (size_t i = 0;
+         i < line.length() && displayLine.length() < 30;
+         ++i) {
+
+        const uint8_t c =
+            static_cast<uint8_t>(line[i]);
+
+        if (c >= 32 && c <= 126) {
+            displayLine += static_cast<char>(c);
+        } else {
+            displayLine += ' ';
         }
-        wardriveSweepLines[WARD_MAX_FEED_LINES - 1] = line;
-        wardriveFeedDirty = true;
-        return;
     }
 
-    wardriveSweepLines[wardriveSweepLineCount++] = line;
+    // Trim repeated trailing spaces.
+    while (displayLine.endsWith(" ")) {
+        displayLine.remove(
+            displayLine.length() - 1
+        );
+    }
+
+    if (displayLine.length() == 0) {
+        displayLine = "<device>";
+    }
+
+    // The live feed is intentionally RAM-only.
+    //
+    // It refreshes frequently and keeping each visual row on SD
+    // creates unnecessary SPI/file contention with the structured
+    // Wardrive CSV logger.
+    //
+    // CSV logging remains the authoritative long-session record.
+
+    // RAM is only the bounded LIVE display window.
+    if (wardriveSweepLineCount >= WARD_MAX_FEED_LINES) {
+        for (uint16_t i = 1;
+             i < WARD_MAX_FEED_LINES;
+             ++i) {
+
+            wardriveSweepLines[i - 1] =
+                wardriveSweepLines[i];
+        }
+
+        wardriveSweepLines[
+            WARD_MAX_FEED_LINES - 1
+        ] = displayLine;
+
+    } else {
+        wardriveSweepLines[
+            wardriveSweepLineCount++
+        ] = displayLine;
+    }
+
     wardriveFeedDirty = true;
+}
+
+void updateWardriveBunnyProgress()
+{
+    const uint16_t total =
+        wardriveSweepLineCount;
+
+    const uint16_t maxStart =
+        total > WARD_FEED_PAGE_ROWS
+            ? total - WARD_FEED_PAGE_ROWS
+            : 0;
+
+    uint8_t level = 0;
+
+    if (maxStart > 0) {
+        // Convert current page position to five visual steps:
+        // 0 = first bunny only
+        // 4 = all five bunnies
+        const uint32_t scaled =
+            static_cast<uint32_t>(
+                wardriveFeedPageStart
+            ) * 4UL;
+
+        level = static_cast<uint8_t>(
+            min<uint32_t>(
+                4UL,
+                (scaled + (maxStart / 2UL)) /
+                    maxStart
+            )
+        );
+    }
+
+    for (uint8_t i = 0;
+         i < WARD_BUNNY_PROGRESS_COUNT;
+         ++i) {
+
+        const bool filled =
+            total > 0 && i <= level;
+
+        const lv_color_t color =
+            filled
+                ? lv_color_hex(0xFF52C8)
+                : lv_color_hex(0x55EEFF);
+
+        const lv_opa_t fillOpacity =
+            filled
+                ? LV_OPA_COVER
+                : LV_OPA_TRANSP;
+
+        lv_obj_t *parts[] = {
+            wardriveBunnyHeads[i],
+            wardriveBunnyEarL[i],
+            wardriveBunnyEarR[i]
+        };
+
+        for (lv_obj_t *part : parts) {
+            if (!part) continue;
+
+            lv_obj_set_style_border_color(
+                part,
+                color,
+                0
+            );
+
+            lv_obj_set_style_bg_color(
+                part,
+                color,
+                0
+            );
+
+            lv_obj_set_style_bg_opa(
+                part,
+                fillOpacity,
+                0
+            );
+        }
+    }
 }
 
 void updateWardriveFeed()
 {
-    if (!wardriveFeedLabel) return;
+    if (!wardrivePageActive ||
+        currentPage != Page::Wardrive ||
+        wardriveExitToReconPending ||
+        !wardriveFeedPageLabel) {
+        return;
+    }
 
-    if (wardriveSweepLineCount == 0) {
+    const uint16_t total =
+        wardriveSweepLineCount;
+
+    if (total == 0) {
+        for (uint8_t i = 0;
+             i < WARD_FEED_PAGE_ROWS;
+             ++i) {
+
+            if (!wardriveFeedRows[i]) continue;
+
+            lv_label_set_text(
+                wardriveFeedRows[i],
+                i == 0
+                    ? (
+                        wardriveRunning
+                            ? "Scanning... waiting"
+                            : "Tap START"
+                      )
+                    : ""
+            );
+        }
+
         lv_label_set_text(
-            wardriveFeedLabel,
-            wardriveRunning
-                ? "Scanning... results will stay here and you can scroll them."
-                : "Tap START to begin wardriving.\nResults will stay here and can be scrolled."
+            wardriveFeedPageLabel,
+            "0 / 0"
         );
+
+        updateWardriveBunnyProgress();
         wardriveFeedDirty = false;
         return;
     }
 
-    String combined;
-    for (uint8_t i = 0; i < wardriveSweepLineCount; ++i) {
-        combined += wardriveSweepLines[i];
-        if (i + 1 < wardriveSweepLineCount) combined += "\n";
+    const uint16_t maxStart =
+        total > WARD_FEED_PAGE_ROWS
+            ? total - WARD_FEED_PAGE_ROWS
+            : 0;
+
+    if (wardriveFeedFollowLatest) {
+        wardriveFeedPageStart = maxStart;
+
+    } else if (
+        wardriveFeedPageStart > maxStart) {
+
+        wardriveFeedPageStart = maxStart;
     }
-    lv_label_set_text(wardriveFeedLabel, combined.c_str());
+
+    for (uint8_t row = 0;
+         row < WARD_FEED_PAGE_ROWS;
+         ++row) {
+
+        lv_obj_t *label =
+            wardriveFeedRows[row];
+
+        if (!label) continue;
+
+        const uint16_t index =
+            static_cast<uint16_t>(
+                wardriveFeedPageStart + row
+            );
+
+        if (index < total) {
+            lv_label_set_text(
+                label,
+                wardriveSweepLines[index].c_str()
+            );
+        } else {
+            lv_label_set_text(
+                label,
+                ""
+            );
+        }
+    }
+
+    const uint16_t firstShown =
+        static_cast<uint16_t>(
+            wardriveFeedPageStart + 1
+        );
+
+    const uint16_t lastShown =
+        min<uint16_t>(
+            total,
+            static_cast<uint16_t>(
+                wardriveFeedPageStart +
+                WARD_FEED_PAGE_ROWS
+            )
+        );
+
+    // Show RAM-window position. Full SD history count remains separate.
+    lv_label_set_text_fmt(
+        wardriveFeedPageLabel,
+        "%u-%u/%u",
+        static_cast<unsigned>(firstShown),
+        static_cast<unsigned>(lastShown),
+        static_cast<unsigned>(total)
+    );
+
+    updateWardriveBunnyProgress();
+
     wardriveFeedDirty = false;
 }
 
+void wardriveFeedPageEvent(lv_event_t *e)
+{
+    if (!wardrivePageActive ||
+        currentPage != Page::Wardrive ||
+        wardriveExitToReconPending) {
+        return;
+    }
+
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED ||
+        !clickAllowed()) {
+        return;
+    }
+
+    const uint16_t total =
+        wardriveSweepLineCount;
+
+    if (total == 0) return;
+
+    const intptr_t direction =
+        reinterpret_cast<intptr_t>(
+            lv_event_get_user_data(e)
+        );
+
+    const uint16_t maxStart =
+        total > WARD_FEED_PAGE_ROWS
+            ? total - WARD_FEED_PAGE_ROWS
+            : 0;
+
+    if (direction < 0) {
+        wardriveFeedFollowLatest = false;
+
+        if (wardriveFeedPageStart >=
+            WARD_FEED_PAGE_ROWS) {
+
+            wardriveFeedPageStart -=
+                WARD_FEED_PAGE_ROWS;
+        } else {
+            wardriveFeedPageStart = 0;
+        }
+
+    } else {
+        const uint32_t nextStart =
+            wardriveFeedPageStart +
+            WARD_FEED_PAGE_ROWS;
+
+        if (nextStart < maxStart) {
+            wardriveFeedPageStart =
+                nextStart;
+
+            wardriveFeedFollowLatest =
+                false;
+
+        } else {
+            wardriveFeedPageStart =
+                maxStart;
+
+            wardriveFeedFollowLatest =
+                true;
+        }
+    }
+
+    wardriveFeedDirty = true;
+    updateWardriveFeed();
+
+    noteActivity();
+    hapticTap();
+}
 
 bool ensureM33KSdDirectories()
 {
@@ -2935,9 +3757,16 @@ bool appendWardriveRecordGroupToSd(bool wifiRecords, uint32_t seenSinceMs)
     File file = SD.open(wardriveLogPath.c_str(), FILE_APPEND);
     if (!file) {
         instance.unlockSPI();
-        m33kSdReady = false;
+
+        // Preserve physical card-ready state. This may be a transient
+        // SPI/file contention failure rather than card removal.
         wardriveSdLogging = false;
-        Serial.println("[M33K][SD] Wardrive append open failed; continuing without SD logging");
+
+        Serial.printf(
+            "[M33K][SD] Wardrive CSV append failed after %lu rows; logging paused\n",
+            (unsigned long)wardriveSdRowsWritten
+        );
+
         return false;
     }
 
@@ -2946,7 +3775,7 @@ bool appendWardriveRecordGroupToSd(bool wifiRecords, uint32_t seenSinceMs)
 
     uint32_t rows = 0;
 
-    for (uint8_t i = 0; i < wardriveRecordCount; ++i) {
+    for (uint16_t i = 0; i < wardriveRecordCount; ++i) {
         WardriveRecord &rec = wardriveRecords[i];
 
         if (!rec.active ||
@@ -3018,13 +3847,44 @@ void stopWardriveSdLog()
 
 void updateWardriveUi()
 {
-    if (currentPage != Page::Wardrive) return;
+    // Wardrive data collection continues while the display is
+    // dark. Defer LVGL visual synchronization until wake.
+    if (screenSleeping) {
+        wardriveUiSyncPending = true;
+        return;
+    }
+
+
+    // Time-share NimBLE and display SPI.
+    // Data collection continues; only LVGL drawing pauses.
+    const bool wardriveRadioUiHold =
+        c5DiscoveryInFlight ||
+        c5ScanInFlight ||
+        c5TransportConnected() ||
+        wardrivePhase == WardrivePhase::BleScanning ||
+        (int32_t)(millis() - wardriveDisplayResumeMs) < 0;
+
+    if (wardriveRadioUiHold) {
+        wardriveUiSyncPending = true;
+        return;
+    }
+
+
+    if (!wardrivePageActive ||
+        currentPage != Page::Wardrive ||
+        wardriveExitToReconPending) {
+        return;
+    }
 
     if (wardriveWifiLabel) {
         lv_label_set_text_fmt(wardriveWifiLabel, "WI-FI\n%u", (unsigned)wardriveTotalWifiCount);
     }
     if (wardriveBleLabel) {
-        lv_label_set_text_fmt(wardriveBleLabel, "BLE\n%u", (unsigned)wardriveBleCount);
+        lv_label_set_text_fmt(
+            wardriveBleLabel,
+            "BLE\n%lu",
+            (unsigned long)wardriveTotalBleCount
+        );
     }
 
     const bool fix = gpsParser.location.isValid() && gpsParser.location.age() < 5000;
@@ -3092,6 +3952,16 @@ void updateWardriveUi()
             wardriveRunning ? "LIVE SCAN FEED" : "SCAN FEED"
         );
     }
+
+    // Reassert the visible button state from the authoritative session flag.
+    // This also recovers the label after a delayed scan callback/UI refresh.
+    if (wardriveStartLabel) {
+        lv_label_set_text(
+            wardriveStartLabel,
+            wardriveRunning ? "STOP" : "START"
+        );
+    }
+
     if (wardriveFeedDirty) {
         updateWardriveFeed();
     }
@@ -3099,6 +3969,11 @@ void updateWardriveUi()
 
 void stopWardriveTool()
 {
+    wardrivePageActive = false;
+    wardriveUiSyncPending = false;
+    wardriveFeedScrolling = false;
+    wardriveDetailOpen = false;
+
     if (wardriveTimer) {
         lv_timer_del(wardriveTimer);
         wardriveTimer = nullptr;
@@ -3120,8 +3995,31 @@ void stopWardriveTool()
         }
     }
 
+    // Preserve/arm deferred cleanup when leaving Wardrive.
+    // Back navigation can occur while C5 discovery, authentication,
+    // or a 5 GHz scan is still active.
+    const bool wardriveRadioCleanupNeeded =
+        wardriveStopCleanupPending ||
+        wardriveC5CycleActive ||
+        c5DiscoveryInFlight ||
+        c5ScanInFlight ||
+        c5TransportConnected();
+
     wardriveRunning = false;
-    wardriveStopCleanupPending = false;
+    wardriveStopCleanupPending =
+        wardriveRadioCleanupNeeded;
+
+    if (wardriveStopCleanupPending &&
+        c5Client &&
+        c5Client->isConnected()) {
+
+        c5Client->disconnect();
+
+        Serial.println(
+            "[M33K WARD] exit requested C5 disconnect"
+        );
+    }
+
     stopWardriveSdLog();
     wardrivePhase = WardrivePhase::Stopped;
 }
@@ -3130,26 +4028,64 @@ bool startWardriveBleScan()
 {
     initBleScanner();
     NimBLEScan *scan = NimBLEDevice::getScan();
-    if (scan->isScanning()) scan->stop();
+
+    // Never steal NimBLE from C5 discovery/GATT activity.
+    if (scan->isScanning()) {
+        Serial.println(
+            "[M33K WARD] BLE sample deferred; scanner busy"
+        );
+        return false;
+    }
+
+    // C5 client must be completely gone before target BLE starts.
+    if (c5Client ||
+        c5DiscoveryInFlight ||
+        c5ScanInFlight ||
+        c5TransportConnected()) {
+
+        Serial.println(
+            "[M33K WARD] BLE sample deferred; C5 cleanup pending"
+        );
+        return false;
+    }
+
     scan->clearResults();
-    scan->setMaxResults(28);
+    scan->setMaxResults(12);
     bleScanFinished = false;
     bleScanEndReason = 0;
     wardrivePhase = WardrivePhase::BleScanning;
     if (wardriveStatusLabel) lv_label_set_text(wardriveStatusLabel, "SESSION LIVE  |  SCANNING BLE...");
-    const bool started = scan->start(2200, false, true);
+    const bool started = scan->start(900, false, true);
     if (!started) scan->setMaxResults(MAX_BLE_DETAILS);
     return started;
 }
 
 void finishWardriveWifiScan()
 {
+    if (!wardrivePageActive || !wardriveRunning) {
+        WiFi.scanDelete();
+        return;
+    }
+
     const int16_t result = WiFi.scanComplete();
     if (result == WIFI_SCAN_FAILED) {
         wardrivePhase = WardrivePhase::Failed;
         if (wardriveStatusLabel) lv_label_set_text(wardriveStatusLabel, "WARDRIVE WI-FI SCAN FAILED");
         WiFi.scanDelete();
         return;
+    }
+
+    // Count every raw watch-side Wi-Fi result before the shared
+    // UI/detail cache truncates the list. The cache stays bounded,
+    // but the Wardrive session total does not.
+    if (result > 0) {
+        for (int16_t i = 0; i < result; ++i) {
+            const String rawBssid = WiFi.BSSIDstr(i);
+
+            if (rawBssid.length() > 0) {
+                wardriveTrackWifiTotal(rawBssid);
+            }
+        }
     }
 
     captureLocalWifiResults(result);
@@ -3171,8 +4107,12 @@ void finishWardriveWifiScan()
 
         const String &ssid = detail.ssid;
         const String &bssid = detail.bssid;
+
+        // Session total remains unique for the entire drive.
         wardriveTrackWifiTotal(bssid);
-        String key = ssid + "|" + bssid;
+
+        String key =
+            ssid + "|" + bssid;
         if (!wardriveHasWifi(key) && wardriveWifiCount < WARD_MAX_WIFI) {
             wardriveWifiKeys[wardriveWifiCount++] = key;
         }
@@ -3189,8 +4129,31 @@ void finishWardriveWifiScan()
             if (existed && rec->seenCount < 65535) ++rec->seenCount;
             rec->lastSeenMs = millis();
             snapshotWardriveLocation(*rec);
-            updateWardriveRecordLabel(*rec);
+
+            // Feed history is handled independently below.
+            // This RAM record can still update details when available.
         }
+
+        // Live feed is intentionally NOT session-unique.
+        // Each completed Wi-Fi scan can refresh currently visible APs.
+        // wardriveAddSweepLine() maintains the bounded rolling window
+        // and automatically drops the oldest rows when it reaches 120.
+        String line =
+            band5
+                ? "5G  "
+                : "2.4  ";
+
+        line +=
+            ssid.length()
+                ? ssid
+                : String("<hidden>");
+
+        line += "  ";
+        line += String(detail.rssi);
+        line += "dBm CH";
+        line += String(detail.channel);
+
+        wardriveAddSweepLine(line);
     }
 
     appendWardriveRecordGroupToSd(true, sdSeenSinceMs);
@@ -3199,17 +4162,58 @@ void finishWardriveWifiScan()
         wardriveC5CacheApplied = true;
         wardriveAppliedC5Generation = c5ScanGeneration;
     }
+
+    // If the C5 completed the sweep we requested, its newly
+    // published cache has now been merged into Wardrive.
+    // Release the BLE client immediately to recover DMA RAM.
+    if (wardriveC5CycleActive &&
+        !c5ScanInFlight &&
+        c5ScanGeneration != wardriveC5RequestGeneration) {
+
+        Serial.printf(
+            "[M33K WARD] C5 generation %lu consumed; releasing transport\n",
+            (unsigned long)c5ScanGeneration
+        );
+
+        wardriveC5CycleActive = false;
+        wardriveNextC5CycleMs =
+            millis() + WARD_C5_INTERVAL_MS;
+
+        // Give NimBLE/display DMA allocations time to settle before
+        // launching the watch-side BLE scanner.
+        wardriveNextBleSampleMs =
+            millis() + 2500UL;
+
+        if (c5Client && c5Client->isConnected()) {
+            c5Client->disconnect();
+        }
+    }
+
     WiFi.scanDelete();
     updateWardriveUi();
 
-    if (!startWardriveBleScan()) {
-        wardrivePhase = WardrivePhase::Failed;
-        if (wardriveStatusLabel) lv_label_set_text(wardriveStatusLabel, "WARDRIVE BLE SCAN COULD NOT START");
+    // Return to idle. wardriveTimerCb() independently schedules
+    // watch BLE, Wi-Fi, and the optional C5 without coupling them.
+    wardrivePhase = WardrivePhase::Idle;
+    wardriveNextSweepMs = millis() + 1800;
+
+    if (wardriveStatusLabel) {
+        lv_label_set_text(
+            wardriveStatusLabel,
+            "SESSION LIVE"
+        );
     }
 }
 
 void finishWardriveBleScan()
 {
+    if (!wardrivePageActive || !wardriveRunning) {
+        if (bleScannerInitialized) {
+            NimBLEDevice::getScan()->clearResults();
+        }
+        return;
+    }
+
     if (!bleScannerInitialized) {
         wardrivePhase = WardrivePhase::Failed;
         return;
@@ -3223,7 +4227,14 @@ void finishWardriveBleScan()
         const NimBLEAdvertisedDevice *dev = results.getDevice(i);
         if (!dev) continue;
         String addr = String(dev->getAddress().toString().c_str());
-        if (!wardriveHasBle(addr) && wardriveBleCount < WARD_MAX_BLE) {
+
+        wardriveTrackBleTotal(addr);
+
+        // Live BLE feed is allowed to refresh on each scan cycle.
+        // Session uniqueness is tracked independently.
+
+        if (!wardriveHasBle(addr) &&
+            wardriveBleCount < WARD_MAX_BLE) {
             wardriveBleAddrs[wardriveBleCount++] = addr;
         }
 
@@ -3245,24 +4256,76 @@ void finishWardriveBleScan()
             if (existed && rec->seenCount < 65535) ++rec->seenCount;
             rec->lastSeenMs = millis();
             snapshotWardriveLocation(*rec);
-            updateWardriveRecordLabel(*rec);
+
+            // Feed history is handled independently below.
+            // RAM record details still update when this cache entry exists.
         }
+
+        // Show devices that are actually present in the current BLE
+        // sample. Repeated sightings on later scans are intentional:
+        // this is a real-time rolling feed, not session history.
+        const bool trackerLike =
+            isAppleFindMyTrackerLike(dev);
+
+        String line =
+            trackerLike
+                ? "TRACKER  "
+                : "BLE  ";
+
+        line +=
+            name.length()
+                ? name
+                : addr;
+
+        line += "  ";
+        line += String(dev->getRSSI());
+        line += "dBm";
+
+        wardriveAddSweepLine(line);
     }
 
     appendWardriveRecordGroupToSd(false, sdSeenSinceMs);
 
+    // All advertised-device information has been copied into
+    // Wardrive-owned records. Release NimBLE result objects now.
     scan->clearResults();
     scan->setMaxResults(MAX_BLE_DETAILS);
+
     wardrivePhase = WardrivePhase::Idle;
     wardriveNextSweepMs = millis() + 1800;
-    if (wardriveStatusLabel) lv_label_set_text(wardriveStatusLabel, "SESSION LIVE  |  GPS + RADIO CAPTURE");
-    updateWardriveUi();
+
+    // Quiet window before display DMA resumes.
+    wardriveDisplayResumeMs =
+        millis() + 1500UL;
+
+    wardriveUiSyncPending = true;
+
+    Serial.println(
+        "[M33K WARD] BLE results released; display cooldown"
+    );
+
+    if (wardriveStatusLabel) {
+        lv_label_set_text(
+            wardriveStatusLabel,
+            "SESSION LIVE  |  GPS + RADIO CAPTURE"
+        );
+    }
 }
 
 void beginWardriveSweep()
 {
-    if (currentPage != Page::Wardrive || !wardriveRunning) return;
-    requestC5Scan();
+    if (!wardrivePageActive || !wardriveRunning) return;
+    if (wardriveMemoryPaused) return;
+    // Never start companion activity from Wardrive unless
+    // the C5 is already authenticated and linked.
+    // DIAGNOSTIC:
+    // Keep an already-linked C5 connected, but do not request
+    // fresh 5 GHz results during Wardrive.
+    //
+    // This isolates the C5 scan/result path from the BLE link itself.
+    if (c5IsLinked()) {
+        // requestC5Scan();
+    }
 
     esp_wifi_scan_stop();
     WiFi.scanDelete();
@@ -3295,52 +4358,202 @@ void beginWardriveSweep()
 void wardriveTimerCb(lv_timer_t *timer)
 {
     LV_UNUSED(timer);
-    if (currentPage != Page::Wardrive) return;
+
+    if (currentPage != Page::Wardrive ||
+        !wardrivePageActive ||
+        wardriveExitToReconPending) {
+        return;
+    }
+    // DIAGNOSTIC:
+    // Keep the C5 BLE connection established, but do not continuously
+    // service the C5 transport while Wardrive is active.
     serviceC5Link();
 
-    if (!wardriveFeedScrolling && wardriveUiSyncPending) {
-        syncWardriveRecordRows();
+    const bool wardriveDisplayHold =
+        c5DiscoveryInFlight ||
+        c5ScanInFlight ||
+        c5TransportConnected();
+
+    if (!wardriveDisplayHold) {
+        updateWardriveUi();
+    }
+    if (!wardriveRunning) return;
+
+    const uint32_t wardNow = millis();
+
+    // --------------------------------------------------------
+    // C5 5 GHz transaction scheduler.
+    // --------------------------------------------------------
+
+    // A linked/authenticated C5 gets exactly one scan request.
+    if (!wardriveC5CycleActive &&
+        c5IsLinked() &&
+        !c5ScanInFlight &&
+        wardNow >= wardriveNextC5CycleMs) {
+
+        wardriveC5RequestGeneration =
+            c5ScanGeneration;
+
+        if (requestC5Scan()) {
+            wardriveC5CycleActive = true;
+            wardriveC5CycleStartedMs = wardNow;
+
+            Serial.printf(
+                "[M33K WARD] C5 scan requested generation=%lu\n",
+                (unsigned long)wardriveC5RequestGeneration
+            );
+        }
     }
 
-    updateWardriveUi();
-    if (!wardriveRunning) return;
+    // If C5 is physically on but disconnected, rediscover it
+    // only when the next C5 window arrives.
+    // C5 is optional, but Wardrive discovers it itself.
+    // Only start discovery during a quiet Idle phase.
+    if (wardrivePhase == WardrivePhase::Idle &&
+        !wardriveC5CycleActive &&
+        !c5TransportConnected() &&
+        !c5DiscoveryInFlight &&
+        wardNow >= wardriveNextC5CycleMs) {
+
+        // startC5DiscoveryAsync() normally honors its global retry
+        // timer. This is an explicit Wardrive transaction window.
+        c5NextConnectAttemptMs = 0;
+
+        if (startC5DiscoveryAsync()) {
+            wardriveC5CycleStartedMs = wardNow;
+
+            Serial.println(
+                "[M33K WARD] scheduled C5 discovery started"
+            );
+        } else {
+            wardriveNextC5CycleMs =
+                wardNow + WARD_C5_INTERVAL_MS;
+        }
+    }
+
+    // Never let an unsuccessful transaction hold the C5 client.
+    if (wardriveC5CycleActive &&
+        wardNow - wardriveC5CycleStartedMs >
+            WARD_C5_TIMEOUT_MS) {
+
+        Serial.println(
+            "[M33K WARD] C5 transaction timed out; disconnecting"
+        );
+
+        wardriveC5CycleActive = false;
+        wardriveNextC5CycleMs =
+            wardNow + WARD_C5_INTERVAL_MS;
+
+        if (c5Client && c5Client->isConnected()) {
+            c5Client->disconnect();
+        }
+    }
+
+    // --------------------------------------------------------
+    // Watch-side BLE scanner.
+    //
+    // Never overlap BLE target scanning with C5 discovery,
+    // authentication, scan transfer, or a live C5 connection.
+    // --------------------------------------------------------
+
+    const bool c5RadioBusy =
+        c5DiscoveryInFlight ||
+        c5ScanInFlight ||
+        c5TransportConnected();
+
+    if (wardrivePhase == WardrivePhase::Idle &&
+        !c5RadioBusy &&
+        wardNow >= wardriveNextBleSampleMs) {
+
+        wardriveNextBleSampleMs =
+            wardNow + WARD_BLE_INTERVAL_MS;
+
+        if (startWardriveBleScan()) {
+            Serial.println(
+                "[M33K WARD] watch BLE sample started"
+            );
+            return;
+        }
+
+        Serial.println(
+            "[M33K WARD] watch BLE sample skipped"
+        );
+    }
+
+
+    const uint32_t freeHeap = ESP.getFreeHeap();
+    const uint32_t largestBlock =
+        heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
 
     if (millis() - wardriveLastDiagMs >= 5000) {
         wardriveLastDiagMs = millis();
 
+        const uint32_t dmaFree =
+            heap_caps_get_free_size(
+                MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL
+            );
+
+        const uint32_t dmaLargest =
+            heap_caps_get_largest_free_block(
+                MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL
+            );
+
+        const uint32_t dmaMin =
+            heap_caps_get_minimum_free_size(
+                MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL
+            );
+
         Serial.printf(
-            "[M33K WARD] heap=%u minHeap=%u stack=%u records=%u C5=%s\n",
-            (unsigned)ESP.getFreeHeap(),
+            "[M33K DMA] free=%u largest=%u min=%u\n",
+            (unsigned)dmaFree,
+            (unsigned)dmaLargest,
+            (unsigned)dmaMin
+        );
+
+        Serial.printf(
+            "[M33K WARD] heap=%u minHeap=%u largest=%u stack=%u records=%u wifi=%lu C5=%s gpsAge=%lu gpsBytes=%lu\n",
+            (unsigned)freeHeap,
             (unsigned)ESP.getMinFreeHeap(),
+            (unsigned)largestBlock,
             (unsigned)uxTaskGetStackHighWaterMark(nullptr),
             (unsigned)wardriveRecordCount,
-            c5IsLinked() ? "LINKED" : "OFFLINE"
+            (unsigned long)wardriveTotalWifiCount,
+            c5IsLinked() ? "LINKED" : "OFFLINE",
+            (unsigned long)(millis() - gpsLastByteMs),
+            (unsigned long)gpsSessionBytes
         );
     }
 
-    // Allow a C5 powered on after Wardrive starts to join automatically.
-    // Retry only during the quiet gap between Wardrive sweeps.
-    if (wardrivePhase == WardrivePhase::Idle && !c5IsLinked()) {
-        if (!c5TransportConnected() &&
-            !c5DiscoveryInFlight &&
-            millis() >= c5NextConnectAttemptMs) {
-
-            if (startC5DiscoveryAsync()) {
-                if (wardriveStatusLabel) {
-                    lv_label_set_text(
-                        wardriveStatusLabel,
-                        "SESSION LIVE  |  SEARCHING FOR C5..."
-                    );
-                }
-                return;
+    if (wardrivePhase == WardrivePhase::Idle) {
+        if (!wardriveMemoryPaused &&
+            (freeHeap < WARD_HEAP_PAUSE_BYTES ||
+             largestBlock < WARD_LARGEST_BLOCK_PAUSE_BYTES)) {
+            wardriveMemoryPaused = true;
+            if (wardriveStatusLabel) {
+                lv_label_set_text(
+                    wardriveStatusLabel,
+                    "MEMORY GUARD  |  SCANS PAUSED"
+                );
             }
+            Serial.println("[M33K WARD] memory guard paused new sweeps");
+        } else if (wardriveMemoryPaused &&
+                   freeHeap > WARD_HEAP_RESUME_BYTES &&
+                   largestBlock > WARD_LARGEST_BLOCK_RESUME_BYTES) {
+            wardriveMemoryPaused = false;
+            wardriveNextSweepMs = millis() + 750;
+            if (wardriveStatusLabel) {
+                lv_label_set_text(
+                    wardriveStatusLabel,
+                    "SESSION LIVE  |  MEMORY RECOVERED"
+                );
+            }
+            Serial.println("[M33K WARD] memory guard resumed sweeps");
         }
 
-        if (c5DiscoveryInFlight || c5TransportConnected()) {
-            return;
-        }
+        if (wardriveMemoryPaused) return;
     }
 
+    // C5 discovery is handled by the time-share scheduler.
     if (wardrivePhase == WardrivePhase::WifiScanning) {
         int16_t result = WiFi.scanComplete();
         if (result == WIFI_SCAN_RUNNING) return;
@@ -3354,19 +4567,174 @@ void startWardriveSession()
 {
     wardriveWifiCount = 0;
     wardriveTotalWifiCount = 0;
+    memset(wardriveTotalWifiBloom, 0, sizeof(wardriveTotalWifiBloom));
+    wardriveMemoryPaused = false;
+    wardrivePageActive = true;
     wardriveBleCount = 0;
+
+    wardriveTotalBleCount = 0;
+
+    memset(
+        wardriveTotalBleBloom,
+        0,
+        sizeof(wardriveTotalBleBloom)
+    );
+
     wardriveDetailOpen = false;
     wardriveUiSyncCursor = 0;
     wardriveLastDiagMs = 0;
+    wardriveDisplayResumeMs = 0;
     wardriveC5CacheApplied = false;
     wardriveAppliedC5Generation = c5ScanGeneration;
+
+    // --------------------------------------------------------
+    // New-session Wardrive radio reset.
+    //
+    // Clear completed/stale scan state left behind by the
+    // previous Wardrive session before starting another.
+    // --------------------------------------------------------
+    esp_wifi_scan_stop();
+    WiFi.scanDelete();
+
+    if (bleScannerInitialized &&
+        !c5DiscoveryInFlight &&
+        !c5ScanInFlight) {
+
+        NimBLEScan *scan =
+            NimBLEDevice::getScan();
+
+        if (scan->isScanning()) {
+            scan->stop();
+        }
+
+        scan->clearResults();
+        scan->setMaxResults(MAX_BLE_DETAILS);
+    }
+
+    bleScanFinished = false;
+    bleScanEndReason = 0;
+
+    // Every Wardrive START explicitly re-arms C5 discovery.
+    c5NextConnectAttemptMs = 0;
     resetWardriveRecords();
+    wardriveResetSweepFeed();
+    wardriveFeedDirty = true;
     wardriveSessionStartedMs = millis();
     wardriveNextSweepMs = 0;
+
+    wardriveC5CycleActive = false;
+    wardriveC5CycleStartedMs = 0;
+    wardriveC5RequestGeneration = c5ScanGeneration;
+
+    // Re-arm optional C5 discovery for every new Wardrive session.
+    // A previous Wardrive exit can leave a transport/client object
+    // behind even though authentication/link state is no longer valid.
+    c5NextConnectAttemptMs = 0;
+
+    // Preserve a genuinely authenticated C5 link.
+    // Only remove a stale unauthenticated client when no C5 BLE
+    // discovery/scan transaction is currently active.
+    if (!c5IsLinked() &&
+        !c5DiscoveryInFlight &&
+        !c5ScanInFlight &&
+        c5Client) {
+
+        if (c5Client->isConnected()) {
+            c5Client->disconnect();
+        }
+
+        NimBLEDevice::deleteClient(c5Client);
+        c5Client = nullptr;
+        c5Authenticated = false;
+
+        Serial.println(
+            "[M33K WARD] stale C5 client cleared for new session"
+        );
+    }
+
+    // Watch-side BLE is a core Wardrive function.
+    // Give it the first NimBLE radio window even when the
+    // optional C5 is powered off.
+    wardriveNextBleSampleMs = millis() + 1000UL;
+
+    // Wardrive discovers C5 itself; Wi-Fi Scanner is not required.
+    wardriveNextC5CycleMs = millis() + 1500UL;
+
     wardriveLastElapsedSeconds = 0;
-    startWardriveSdLog();
+
+    const bool wardriveSdStarted =
+        startWardriveSdLog();
+
+    if (wardriveSdLabel) {
+        if (wardriveSdStarted) {
+            lv_label_set_text(
+                wardriveSdLabel,
+                "SD LOGGING\n0 ROWS"
+            );
+
+            lv_obj_set_style_text_color(
+                wardriveSdLabel,
+                lv_color_hex(0x7CFF45),
+                0
+            );
+        } else {
+            lv_label_set_text(
+                wardriveSdLabel,
+                "SD OFFLINE"
+            );
+
+            lv_obj_set_style_text_color(
+                wardriveSdLabel,
+                lv_color_hex(0xF5FF3B),
+                0
+            );
+        }
+    }
+
+    Serial.printf(
+        "[M33K WARD] SD startup=%s\n",
+        wardriveSdStarted
+            ? "LOGGING"
+            : "OFFLINE"
+    );
+
     wardriveRunning = true;
     wardrivePhase = WardrivePhase::Idle;
+
+    // Wardrive owns C5 discovery.
+    //
+    // Try once immediately before the continuous local Wi-Fi/BLE
+    // pipeline starts. This removes the requirement to visit the
+    // Wi-Fi Scanner page first.
+    if (!c5IsLinked() &&
+        !c5TransportConnected() &&
+        !c5DiscoveryInFlight) {
+
+        c5NextConnectAttemptMs = 0;
+
+        if (startC5DiscoveryAsync()) {
+            wardriveC5CycleStartedMs = millis();
+
+            Serial.println(
+                "[M33K WARD] initial C5 discovery started"
+            );
+
+            if (wardriveStatusLabel) {
+                lv_label_set_text(
+                    wardriveStatusLabel,
+                    "SESSION STARTING  |  LOOKING FOR C5..."
+                );
+            }
+        } else {
+            // Do not block local Wardrive if C5 cannot start.
+            wardriveNextC5CycleMs =
+                millis() + 15000UL;
+
+            Serial.println(
+                "[M33K WARD] initial C5 discovery unavailable; local mode"
+            );
+        }
+    }
 
     // Wardrive shares the same continuously-running GNSS stream as GPS.
     // Do not tear down/reopen UART1 when entering Wardrive.
@@ -3380,7 +4748,18 @@ void startWardriveSession()
     if (wardriveStartLabel) lv_label_set_text(wardriveStartLabel, "STOP");
     if (wardriveStatusLabel) lv_label_set_text(wardriveStatusLabel, "SESSION STARTED");
     updateWardriveUi();
-    beginWardriveSweep();
+
+    // Do not launch the first local Wi-Fi sweep on top of the
+    // initial C5 BLE discovery. Once discovery finishes, the
+    // Wardrive timer starts the normal continuous pipeline.
+    if (!c5DiscoveryInFlight &&
+        !c5TransportConnected()) {
+
+        beginWardriveSweep();
+    } else {
+        wardriveNextSweepMs =
+            millis() + 250UL;
+    }
 }
 
 void stopWardriveSession()
@@ -3398,7 +4777,22 @@ void stopWardriveSession()
     // resets Wi-Fi scan state before reuse.
     wardriveRunning = false;
     wardrivePhase = WardrivePhase::Stopped;
-    wardriveStopCleanupPending = false;
+
+    // A C5 transaction may still be active when STOP is pressed.
+    // Do not carry that client/transaction into the next session.
+    wardriveStopCleanupPending = true;
+
+    wardriveC5CycleActive = false;
+    wardriveC5CycleStartedMs = 0;
+    c5NextConnectAttemptMs = 0;
+
+    // Ask the active C5 transport to terminate now.
+    // Actual client deletion is deferred until callbacks/scans
+    // are no longer using it.
+    if (c5Client && c5Client->isConnected()) {
+        c5Client->disconnect();
+    }
+
     stopWardriveSdLog();
 
     Serial.printf(
@@ -3409,10 +4803,15 @@ void stopWardriveSession()
     );
 
     if (wardriveStartLabel) lv_label_set_text(wardriveStartLabel, "START");
+
     if (wardriveStatusLabel) {
-        lv_label_set_text(
+        lv_label_set_text_fmt(
             wardriveStatusLabel,
-            "SESSION STOPPED  |  RESULTS HELD ON SCREEN"
+            "STOPPED  %02lu:%02lu  |  WI-FI %lu  |  BLE %lu",
+            (unsigned long)(wardriveLastElapsedSeconds / 60UL),
+            (unsigned long)(wardriveLastElapsedSeconds % 60UL),
+            (unsigned long)wardriveTotalWifiCount,
+            (unsigned long)wardriveTotalBleCount
         );
     }
 }
@@ -3420,7 +4819,11 @@ void stopWardriveSession()
 void wardriveStartEvent(lv_event_t *e)
 {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED || !clickAllowed()) return;
-    
+
+    const uint32_t now = millis();
+    if (now - wardriveLastStartStopMs < 700) return;
+    wardriveLastStartStopMs = now;
+
     noteActivity();
     hapticTap();
     if (wardriveRunning) {
@@ -3440,10 +4843,13 @@ void wardriveStartEvent(lv_event_t *e)
 void reconWardriveEvent(lv_event_t *e)
 {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED || !clickAllowed()) return;
-    
+
     noteActivity();
     hapticTap();
-    showWardrivePage();
+
+    // Do not destroy/rebuild the Recon LVGL tree from inside its own CLICKED
+    // callback. Defer Wardrive creation until the callback has returned.
+    wardriveOpenFromReconPending = true;
 }
 
 void IRAM_ATTR m33kRadioPacketIsr()
@@ -4817,6 +6223,36 @@ void reconSubBackEvent(lv_event_t *e)
 
     noteActivity();
     hapticTap();
+
+    // Wardrive can be inside a live scroll/touch callback when Back is tapped.
+    // Rebuilding the whole screen from inside that callback can leave LVGL
+    // processing objects that were just deleted. Defer the page transition
+    // until the next Arduino loop pass, after LVGL returns from the event.
+    if (currentPage == Page::Wardrive) {
+        // Freeze every Wardrive UI path immediately.
+        // Recon is still created later, outside this LVGL callback.
+        wardriveExitToReconPending = true;
+        wardrivePageActive = false;
+        wardriveRunning = false;
+        wardriveUiSyncPending = false;
+        wardriveFeedDirty = false;
+        wardriveFeedScrolling = false;
+        wardriveDetailOpen = false;
+
+        // Do not allow the 150 ms Wardrive timer to touch LVGL objects
+        // while the deferred Wardrive -> Recon transition is waiting.
+        if (wardriveTimer) {
+            lv_timer_del(wardriveTimer);
+            wardriveTimer = nullptr;
+        }
+
+        // End session-side logging immediately. Radio scans already in
+        // progress are still allowed to finish naturally.
+        wardriveSdLogging = false;
+
+        return;
+    }
+
     showReconPage();
 }
 
@@ -8451,6 +9887,10 @@ void clearPageTimers()
         lv_timer_del(wardriveTimer);
         wardriveTimer = nullptr;
     }
+    if (mapTimer) {
+        lv_timer_del(mapTimer);
+        mapTimer = nullptr;
+    }
     if (radioTimer) {
         lv_timer_del(radioTimer);
         radioTimer = nullptr;
@@ -8518,6 +9958,19 @@ void resetLivePointers()
     gpsUtcLabel = nullptr;
     gpsDataLabel = nullptr;
 
+    mapStatusLabel = nullptr;
+    mapCoordLabel = nullptr;
+    mapZoomLabel = nullptr;
+    mapSdLabel = nullptr;
+    mapMarkerLabel = nullptr;
+    mapMarkerDot = nullptr;
+    mapViewport = nullptr;
+    mapTileCanvas = nullptr;
+    mapTilePlaceholder = nullptr;
+    for (auto &label : mapVectorLabels) label = nullptr;
+    for (auto &line : mapGridVertical) line = nullptr;
+    for (auto &line : mapGridHorizontal) line = nullptr;
+
     nfcStatusLabel = nullptr;
     nfcTypeLabel = nullptr;
     nfcUidLabel = nullptr;
@@ -8548,6 +10001,8 @@ void resetLivePointers()
     wardriveFeedScroll = nullptr;
     wardriveFeedLabel = nullptr;
     wardriveFeedStateLabel = nullptr;
+    for (auto &row : wardriveFeedRows) row = nullptr;
+    wardriveFeedPageLabel = nullptr;
     wardriveStartLabel = nullptr;
     wardriveSdLabel = nullptr;
     wardriveDetailOverlay = nullptr;
@@ -8639,6 +10094,24 @@ void clearScreen()
     if (!screen) screen = lv_screen_active();
 
     lv_obj_clean(screen);
+
+    if (mapTileBuffer) {
+        heap_caps_free(mapTileBuffer);
+        mapTileBuffer = nullptr;
+    }
+    mapTileLoaded = false;
+    mapLoadedTileX = -1;
+    mapLoadedTileY = -1;
+    mapLoadedTileZ = -1;
+    mapRequestedTileX = -1;
+    mapRequestedTileY = -1;
+    mapRequestedTileZ = -1;
+    mapLoadedWorldX = -1;
+    mapLoadedWorldY = -1;
+    mapRequestedWorldX = -1;
+    mapRequestedWorldY = -1;
+    mapTileReloadPending = false;
+
     lv_obj_set_style_bg_color(screen, lv_color_hex(0x030711), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, LV_PART_MAIN);
 }
@@ -8861,6 +10334,7 @@ void showSignalHunterPage();
 void showWatchModePage();
 void showWardrivePage();
 void showGpsPage();
+void showMapPage();
 void showNfcPage();
 void showLogsPage();
 void showSettingsPage();
@@ -8913,14 +10387,47 @@ void performHardwareBack()
         return;
     }
 
+    if (currentPage == Page::Wardrive) {
+        wardriveExitToReconPending = true;
+        wardrivePageActive = false;
+        wardriveRunning = false;
+        wardriveUiSyncPending = false;
+        return;
+    }
+
+    if (currentPage == Page::WiFi) {
+        wifiGraphLive = false;
+        wifiSubpageTransition = false;
+        wifiPendingNav = WifiPendingNav::ExitHome;
+        return;
+    }
+
+    if (currentPage == Page::Recon) {
+        reconExitHomePending = true;
+        return;
+    }
+
+    if (currentPage == Page::Map) {
+        showGpsPage();
+        return;
+    }
+
     if (currentPage == Page::ReconPulse ||
         currentPage == Page::Radar ||
         currentPage == Page::SignalHunter ||
         currentPage == Page::WatchMode ||
-        currentPage == Page::Wardrive ||
         currentPage == Page::Radio) {
 
         showReconPage();
+        return;
+    }
+
+    if (currentPage == Page::Stopwatch) {
+        if (stopwatchTimer) {
+            lv_timer_delete(stopwatchTimer);
+            stopwatchTimer = nullptr;
+        }
+        showSettingsPage();
         return;
     }
 
@@ -8967,6 +10474,19 @@ void backEvent(lv_event_t *e)
 
     noteActivity();
     hapticTap();
+
+    if (currentPage == Page::WiFi) {
+        wifiGraphLive = false;
+        wifiSubpageTransition = false;
+        wifiPendingNav = WifiPendingNav::ExitHome;
+        return;
+    }
+
+    if (currentPage == Page::Recon) {
+        reconExitHomePending = true;
+        return;
+    }
+
     showHome();
 }
 
@@ -9319,7 +10839,8 @@ void wifiGraphBackEvent(lv_event_t *e)
     noteActivity();
     hapticTap();
     wifiSubpageTransition = true;
-    showWifiPage();
+    wifiGraphLive = false;
+    wifiPendingNav = WifiPendingNav::BackToScanner;
 }
 
 void wifiGraphOpenEvent(lv_event_t *e)
@@ -9330,7 +10851,7 @@ void wifiGraphOpenEvent(lv_event_t *e)
     noteActivity();
     hapticTap();
     wifiSubpageTransition = true;
-    showWifiGraphPage();
+    wifiPendingNav = WifiPendingNav::OpenGraph;
 }
 
 int32_t wifiPeakRssiForChannel(uint8_t channel)
@@ -10206,6 +11727,7 @@ void showWifiPage()
 {
     clearScreen();
     currentPage = Page::WiFi;
+    wifiPendingNav = WifiPendingNav::None;
     wifiGraphView = false;
 
     // Do not initialize the BLE scanner at boot: that changed the startup
@@ -11163,6 +12685,493 @@ lv_obj_t *createSafeHeaderBack(lv_event_cb_t callback)
     return back;
 }
 
+
+void updateStopwatchDisplay()
+{
+    if (!stopwatchTimeLabel) return;
+
+    uint32_t elapsedMs = stopwatchAccumulatedMs;
+
+    if (stopwatchRunning) {
+        elapsedMs +=
+            static_cast<uint32_t>(
+                millis() - stopwatchStartedMs
+            );
+    }
+
+    const uint32_t hours =
+        elapsedMs / 3600000UL;
+
+    const uint32_t minutes =
+        (elapsedMs / 60000UL) % 60UL;
+
+    const uint32_t seconds =
+        (elapsedMs / 1000UL) % 60UL;
+
+    const uint32_t hundredths =
+        (elapsedMs / 10UL) % 100UL;
+
+    char buffer[24];
+
+    snprintf(
+        buffer,
+        sizeof(buffer),
+        "%02lu:%02lu:%02lu.%02lu",
+        static_cast<unsigned long>(hours),
+        static_cast<unsigned long>(minutes),
+        static_cast<unsigned long>(seconds),
+        static_cast<unsigned long>(hundredths)
+    );
+
+    lv_label_set_text(
+        stopwatchTimeLabel,
+        buffer
+    );
+
+    if (stopwatchStartLabel) {
+        lv_label_set_text(
+            stopwatchStartLabel,
+            stopwatchRunning
+                ? "PAUSE"
+                : "START"
+        );
+    }
+
+    if (stopwatchStatusLabel) {
+        lv_label_set_text(
+            stopwatchStatusLabel,
+            stopwatchRunning
+                ? "RUNNING"
+                : (
+                    elapsedMs > 0
+                        ? "PAUSED"
+                        : "READY"
+                )
+        );
+
+        lv_obj_set_style_text_color(
+            stopwatchStatusLabel,
+            stopwatchRunning
+                ? lv_color_hex(0x7CFF45)
+                : lv_color_hex(0x9AA8BA),
+            0
+        );
+    }
+}
+
+void stopwatchTimerCb(lv_timer_t *timer)
+{
+    LV_UNUSED(timer);
+
+    if (currentPage != Page::Stopwatch) {
+        return;
+    }
+
+    updateStopwatchDisplay();
+}
+
+void stopwatchStartPauseEvent(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    if (!clickAllowed()) return;
+
+    noteActivity();
+    hapticTap();
+
+    const uint32_t now =
+        millis();
+
+    if (stopwatchRunning) {
+        stopwatchAccumulatedMs +=
+            static_cast<uint32_t>(
+                now - stopwatchStartedMs
+            );
+
+        stopwatchRunning = false;
+    } else {
+        stopwatchStartedMs = now;
+        stopwatchRunning = true;
+    }
+
+    updateStopwatchDisplay();
+}
+
+void stopwatchResetEvent(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    if (!clickAllowed()) return;
+
+    noteActivity();
+    hapticTap();
+
+    stopwatchRunning = false;
+    stopwatchStartedMs = 0;
+    stopwatchAccumulatedMs = 0;
+
+    updateStopwatchDisplay();
+}
+
+void stopwatchBackEvent(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    if (!clickAllowed()) return;
+
+    noteActivity();
+    hapticTap();
+
+    if (stopwatchTimer) {
+        lv_timer_delete(stopwatchTimer);
+        stopwatchTimer = nullptr;
+    }
+
+    showSettingsPage();
+}
+
+void showStopwatchPage()
+{
+    clearScreen();
+    currentPage = Page::Stopwatch;
+
+    createSafeHeaderBack(
+        stopwatchBackEvent
+    );
+
+    lv_obj_t *title =
+        lv_label_create(screen);
+
+    lv_label_set_text(
+        title,
+        "STOPWATCH"
+    );
+
+    lv_obj_set_style_text_color(
+        title,
+        lv_color_hex(0xF4F6FF),
+        0
+    );
+
+    lv_obj_set_style_text_font(
+        title,
+        &lv_font_montserrat_20,
+        0
+    );
+
+    lv_obj_align(
+        title,
+        LV_ALIGN_TOP_MID,
+        8,
+        26
+    );
+
+    lv_obj_t *card =
+        lv_obj_create(screen);
+
+    lv_obj_set_size(
+        card,
+        350,
+        190
+    );
+
+    lv_obj_set_pos(
+        card,
+        30,
+        105
+    );
+
+    lv_obj_set_style_bg_color(
+        card,
+        lv_color_hex(0x050B14),
+        0
+    );
+
+    lv_obj_set_style_bg_opa(
+        card,
+        230,
+        0
+    );
+
+    lv_obj_set_style_border_width(
+        card,
+        1,
+        0
+    );
+
+    lv_obj_set_style_border_color(
+        card,
+        lv_color_hex(0x55EEFF),
+        0
+    );
+
+    lv_obj_set_style_radius(
+        card,
+        22,
+        0
+    );
+
+    lv_obj_clear_flag(
+        card,
+        LV_OBJ_FLAG_SCROLLABLE
+    );
+
+    stopwatchStatusLabel =
+        lv_label_create(card);
+
+    lv_label_set_text(
+        stopwatchStatusLabel,
+        "READY"
+    );
+
+    lv_obj_set_style_text_font(
+        stopwatchStatusLabel,
+        &lv_font_montserrat_12,
+        0
+    );
+
+    lv_obj_set_style_text_color(
+        stopwatchStatusLabel,
+        lv_color_hex(0x9AA8BA),
+        0
+    );
+
+    lv_obj_align(
+        stopwatchStatusLabel,
+        LV_ALIGN_TOP_MID,
+        0,
+        18
+    );
+
+    stopwatchTimeLabel =
+        lv_label_create(card);
+
+    lv_label_set_text(
+        stopwatchTimeLabel,
+        "00:00:00.00"
+    );
+
+    lv_obj_set_style_text_font(
+        stopwatchTimeLabel,
+        &lv_font_montserrat_28,
+        0
+    );
+
+    lv_obj_set_style_text_color(
+        stopwatchTimeLabel,
+        lv_color_hex(0x55EEFF),
+        0
+    );
+
+    lv_obj_set_style_text_align(
+        stopwatchTimeLabel,
+        LV_TEXT_ALIGN_CENTER,
+        0
+    );
+
+    lv_obj_align(
+        stopwatchTimeLabel,
+        LV_ALIGN_CENTER,
+        0,
+        3
+    );
+
+    lv_obj_t *hint =
+        lv_label_create(card);
+
+    lv_label_set_text(
+        hint,
+        "HH : MM : SS . 1/100"
+    );
+
+    lv_obj_set_style_text_font(
+        hint,
+        &lv_font_montserrat_10,
+        0
+    );
+
+    lv_obj_set_style_text_color(
+        hint,
+        lv_color_hex(0xFF52C8),
+        0
+    );
+
+    lv_obj_align(
+        hint,
+        LV_ALIGN_BOTTOM_MID,
+        0,
+        -18
+    );
+
+    lv_obj_t *startBtn =
+        lv_button_create(screen);
+
+    lv_obj_set_size(
+        startBtn,
+        150,
+        60
+    );
+
+    lv_obj_set_pos(
+        startBtn,
+        45,
+        330
+    );
+
+    lv_obj_set_style_radius(
+        startBtn,
+        18,
+        0
+    );
+
+    lv_obj_set_style_bg_color(
+        startBtn,
+        lv_color_hex(0x09231E),
+        0
+    );
+
+    lv_obj_set_style_border_width(
+        startBtn,
+        2,
+        0
+    );
+
+    lv_obj_set_style_border_color(
+        startBtn,
+        lv_color_hex(0x7CFF45),
+        0
+    );
+
+    lv_obj_add_event_cb(
+        startBtn,
+        stopwatchStartPauseEvent,
+        LV_EVENT_CLICKED,
+        nullptr
+    );
+
+    stopwatchStartLabel =
+        lv_label_create(startBtn);
+
+    lv_label_set_text(
+        stopwatchStartLabel,
+        stopwatchRunning
+            ? "PAUSE"
+            : "START"
+    );
+
+    lv_obj_set_style_text_color(
+        stopwatchStartLabel,
+        lv_color_hex(0x7CFF45),
+        0
+    );
+
+    lv_obj_set_style_text_font(
+        stopwatchStartLabel,
+        &lv_font_montserrat_16,
+        0
+    );
+
+    lv_obj_center(
+        stopwatchStartLabel
+    );
+
+    lv_obj_t *resetBtn =
+        lv_button_create(screen);
+
+    lv_obj_set_size(
+        resetBtn,
+        150,
+        60
+    );
+
+    lv_obj_set_pos(
+        resetBtn,
+        215,
+        330
+    );
+
+    lv_obj_set_style_radius(
+        resetBtn,
+        18,
+        0
+    );
+
+    lv_obj_set_style_bg_color(
+        resetBtn,
+        lv_color_hex(0x24101F),
+        0
+    );
+
+    lv_obj_set_style_border_width(
+        resetBtn,
+        2,
+        0
+    );
+
+    lv_obj_set_style_border_color(
+        resetBtn,
+        lv_color_hex(0xFF52C8),
+        0
+    );
+
+    lv_obj_add_event_cb(
+        resetBtn,
+        stopwatchResetEvent,
+        LV_EVENT_CLICKED,
+        nullptr
+    );
+
+    lv_obj_t *resetLabel =
+        lv_label_create(resetBtn);
+
+    lv_label_set_text(
+        resetLabel,
+        "RESET"
+    );
+
+    lv_obj_set_style_text_color(
+        resetLabel,
+        lv_color_hex(0xFF72D8),
+        0
+    );
+
+    lv_obj_set_style_text_font(
+        resetLabel,
+        &lv_font_montserrat_16,
+        0
+    );
+
+    lv_obj_center(
+        resetLabel
+    );
+
+    updateStopwatchDisplay();
+
+    if (stopwatchTimer) {
+        lv_timer_delete(
+            stopwatchTimer
+        );
+    }
+
+    stopwatchTimer =
+        lv_timer_create(
+            stopwatchTimerCb,
+            50,
+            nullptr
+        );
+
+    noteActivity();
+}
+
+void stopwatchSettingsEvent(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    if (!clickAllowed()) return;
+
+    noteActivity();
+    hapticTap();
+
+    showStopwatchPage();
+}
+
+
 void showSettingsPage()
 {
     clearScreen();
@@ -11558,11 +13567,38 @@ void showSettingsPage()
         nullptr
     );
 
-    // Invisible spacer makes sure the scroll area extends past the brightness slider.
+    // Utilities
+    lv_obj_t *utilitiesLabel = lv_label_create(settingsContent);
+    lv_label_set_text(utilitiesLabel, "UTILITIES");
+    lv_obj_set_style_text_color(utilitiesLabel, lv_color_hex(0xFF52C8), 0);
+    lv_obj_set_style_text_font(utilitiesLabel, &lv_font_montserrat_12, 0);
+    lv_obj_set_pos(utilitiesLabel, 12, 772);
+
+    lv_obj_t *stopwatchBtn = lv_button_create(settingsContent);
+    lv_obj_set_size(stopwatchBtn, 318, 48);
+    lv_obj_set_pos(stopwatchBtn, 12, 795);
+    lv_obj_set_style_radius(stopwatchBtn, 15, 0);
+    lv_obj_set_style_bg_color(stopwatchBtn, lv_color_hex(0x081823), 0);
+    lv_obj_set_style_border_width(stopwatchBtn, 1, 0);
+    lv_obj_set_style_border_color(stopwatchBtn, lv_color_hex(0x55EEFF), 0);
+    lv_obj_add_event_cb(
+        stopwatchBtn,
+        stopwatchSettingsEvent,
+        LV_EVENT_CLICKED,
+        nullptr
+    );
+
+    lv_obj_t *stopwatchBtnLabel = lv_label_create(stopwatchBtn);
+    lv_label_set_text(stopwatchBtnLabel, "STOPWATCH");
+    lv_obj_set_style_text_color(stopwatchBtnLabel, lv_color_hex(0x55EEFF), 0);
+    lv_obj_set_style_text_font(stopwatchBtnLabel, &lv_font_montserrat_14, 0);
+    lv_obj_center(stopwatchBtnLabel);
+
+    // Invisible spacer keeps Utilities reachable at the bottom.
     lv_obj_t *spacer = lv_obj_create(settingsContent);
     lv_obj_remove_style_all(spacer);
     lv_obj_set_size(spacer, 1, 1);
-    lv_obj_set_pos(spacer, 1, 780);
+    lv_obj_set_pos(spacer, 1, 865);
 
     updateWifiManagerUi();
 
@@ -11685,6 +13721,7 @@ void showWifiGraphPage()
 {
     clearScreen();
     currentPage = Page::WiFi;
+    wifiPendingNav = WifiPendingNav::None;
     wifiGraphView = true;
 
     lv_obj_t *back = lv_button_create(screen);
@@ -12155,6 +14192,7 @@ void showReconPage()
 {
     clearScreen();
     currentPage = Page::Recon;
+    reconExitHomePending = false;
 
     // Treat Recon art like the BLE page background: large, faded, and behind
     // every interactive control so cards/buttons remain readable on top.
@@ -12398,7 +14436,11 @@ void showWardrivePage()
 {
     clearScreen();
     currentPage = Page::Wardrive;
-    startToolC5Discovery();
+    wardriveExitToReconPending = false;
+    wardriveOpenFromReconPending = false;
+    wardrivePageActive = true;
+    // Wardrive must not launch C5 BLE discovery on page entry.
+    // An already-linked C5 can still be used by the Wardrive scan path.
     createSafeHeaderBack(reconSubBackEvent);
 
     lv_obj_t *title = lv_label_create(screen);
@@ -12422,7 +14464,9 @@ void showWardrivePage()
     createReconTile(272, 108, 108, 58, 0xF5FF3B, &wardriveGpsLabel, "GPS\nSEARCHING", 0xF5FF3B);
 
     lv_obj_t *sessionCard = lv_obj_create(screen);
-    lv_obj_set_size(sessionCard, 350, 160);
+    // Extended vertically now that the large bottom START/STOP
+    // button has been moved to the right side.
+    lv_obj_set_size(sessionCard, 350, 210);
     lv_obj_set_pos(sessionCard, 30, 174);
     lv_obj_set_style_radius(sessionCard, 18, 0);
     lv_obj_set_style_bg_color(sessionCard, lv_color_hex(0x07101D), 0);
@@ -12434,13 +14478,9 @@ void showWardrivePage()
     lv_obj_clear_flag(sessionCard, LV_OBJ_FLAG_SCROLL_CHAIN_VER);
     lv_obj_clear_flag(sessionCard, LV_OBJ_FLAG_SCROLL_CHAIN_HOR);
 
-    wardriveElapsedLabel = lv_label_create(sessionCard);
-    lv_label_set_text(wardriveElapsedLabel, "SESSION  00:00");
-    lv_obj_set_width(wardriveElapsedLabel, 326);
-    lv_obj_set_style_text_align(wardriveElapsedLabel, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_color(wardriveElapsedLabel, lv_color_hex(0xFF52C8), 0);
-    lv_obj_set_style_text_font(wardriveElapsedLabel, &lv_font_montserrat_16, 0);
-    lv_obj_set_pos(wardriveElapsedLabel, 12, 8);
+    // Live session timer intentionally omitted.
+    // Internal elapsed-time tracking remains available if needed later.
+    wardriveElapsedLabel = nullptr;
 
     wardriveFeedStateLabel = lv_label_create(sessionCard);
     lv_label_set_text(wardriveFeedStateLabel, "SCAN FEED");
@@ -12449,32 +14489,280 @@ void showWardrivePage()
     lv_obj_set_style_text_font(wardriveFeedStateLabel, &lv_font_montserrat_12, 0);
     lv_obj_set_pos(wardriveFeedStateLabel, 12, 32);
 
+    // Fixed, non-scrollable feed. Six labels stay at permanent coordinates;
+    // page buttons only replace their text. This avoids LVGL scroll/reflow
+    // activity while Wi-Fi/BLE/C5 scan callbacks are updating the session.
     wardriveFeedScroll = lv_obj_create(sessionCard);
-    lv_obj_set_size(wardriveFeedScroll, 228, 100);
+    // Slightly taller Wardrive feed without creating any
+    // additional LVGL objects.
+    lv_obj_set_size(wardriveFeedScroll, 228, 158);
     lv_obj_set_pos(wardriveFeedScroll, 10, 50);
     lv_obj_set_style_radius(wardriveFeedScroll, 12, 0);
     lv_obj_set_style_bg_color(wardriveFeedScroll, lv_color_hex(0x030812), 0);
     lv_obj_set_style_bg_opa(wardriveFeedScroll, 175, 0);
     lv_obj_set_style_border_width(wardriveFeedScroll, 1, 0);
     lv_obj_set_style_border_color(wardriveFeedScroll, lv_color_hex(0x123252), 0);
-    lv_obj_set_style_pad_all(wardriveFeedScroll, 6, 0);
-    lv_obj_set_style_pad_row(wardriveFeedScroll, 5, 0);
-    lv_obj_set_flex_flow(wardriveFeedScroll, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_scroll_dir(wardriveFeedScroll, LV_DIR_VER);
-    lv_obj_add_flag(wardriveFeedScroll, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_clear_flag(wardriveFeedScroll, LV_OBJ_FLAG_SCROLL_ELASTIC);
-    lv_obj_clear_flag(wardriveFeedScroll, LV_OBJ_FLAG_SCROLL_CHAIN_VER);
-    lv_obj_clear_flag(wardriveFeedScroll, LV_OBJ_FLAG_SCROLL_CHAIN_HOR);
-    lv_obj_set_scrollbar_mode(wardriveFeedScroll, LV_SCROLLBAR_MODE_ACTIVE);
-    lv_obj_add_event_cb(wardriveFeedScroll, wardriveFeedScrollEvent, LV_EVENT_ALL, nullptr);
+    lv_obj_set_style_pad_all(wardriveFeedScroll, 0, 0);
+    lv_obj_clear_flag(wardriveFeedScroll, LV_OBJ_FLAG_SCROLLABLE);
 
-    wardriveFeedLabel = lv_label_create(wardriveFeedScroll);
-    lv_label_set_text(wardriveFeedLabel, "Tap START to begin wardriving.\nTap a device later for details.");
-    lv_obj_set_width(wardriveFeedLabel, 208);
-    lv_label_set_long_mode(wardriveFeedLabel, LV_LABEL_LONG_WRAP);
-    lv_obj_set_style_text_color(wardriveFeedLabel, lv_color_hex(0xF4F6FF), 0);
-    lv_obj_set_style_text_font(wardriveFeedLabel, &lv_font_montserrat_12, 0);
-    lv_obj_set_pos(wardriveFeedLabel, 0, 0);
+    for (uint8_t i = 0; i < WARD_FEED_PAGE_ROWS; ++i) {
+        wardriveFeedRows[i] = lv_label_create(wardriveFeedScroll);
+        lv_label_set_text(wardriveFeedRows[i], "");
+        lv_obj_set_width(wardriveFeedRows[i], 158);
+        lv_obj_set_height(wardriveFeedRows[i], 12);
+        lv_label_set_long_mode(wardriveFeedRows[i], LV_LABEL_LONG_CLIP);
+        lv_obj_clear_flag(wardriveFeedRows[i], LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_style_text_color(
+            wardriveFeedRows[i],
+            lv_color_hex(0xF4F6FF),
+            0
+        );
+        lv_obj_set_style_text_font(
+            wardriveFeedRows[i],
+            &lv_font_montserrat_10,
+            0
+        );
+        lv_obj_set_pos(
+            wardriveFeedRows[i],
+            6,
+            7 + i * 22
+        );
+    }
+
+    // --------------------------------------------------------
+    // Bunny-skull feed position indicator.
+    //
+    // Five tiny outlined bunny heads. Cyan = empty,
+    // neon pink = current feed progress.
+    //
+    // Kept intentionally lightweight: 15 tiny LVGL primitives
+    // total and no additional timers/buffers.
+    // --------------------------------------------------------
+    for (uint8_t i = 0;
+         i < WARD_BUNNY_PROGRESS_COUNT;
+         ++i) {
+
+        const int y =
+            40 + static_cast<int>(i) * 16;
+
+        // Head
+        wardriveBunnyHeads[i] =
+            lv_obj_create(wardriveFeedScroll);
+
+        lv_obj_set_size(
+            wardriveBunnyHeads[i],
+            11,
+            9
+        );
+
+        lv_obj_set_pos(
+            wardriveBunnyHeads[i],
+            200,
+            y + 5
+        );
+
+        lv_obj_set_style_radius(
+            wardriveBunnyHeads[i],
+            4,
+            0
+        );
+
+        lv_obj_set_style_border_width(
+            wardriveBunnyHeads[i],
+            1,
+            0
+        );
+
+        lv_obj_set_style_border_color(
+            wardriveBunnyHeads[i],
+            lv_color_hex(0x55EEFF),
+            0
+        );
+
+        lv_obj_set_style_bg_opa(
+            wardriveBunnyHeads[i],
+            LV_OPA_TRANSP,
+            0
+        );
+
+        lv_obj_set_style_pad_all(
+            wardriveBunnyHeads[i],
+            0,
+            0
+        );
+
+        lv_obj_clear_flag(
+            wardriveBunnyHeads[i],
+            LV_OBJ_FLAG_SCROLLABLE
+        );
+
+        // Left ear
+        wardriveBunnyEarL[i] =
+            lv_obj_create(wardriveFeedScroll);
+
+        lv_obj_set_size(
+            wardriveBunnyEarL[i],
+            3,
+            7
+        );
+
+        lv_obj_set_pos(
+            wardriveBunnyEarL[i],
+            202,
+            y
+        );
+
+        lv_obj_set_style_radius(
+            wardriveBunnyEarL[i],
+            2,
+            0
+        );
+
+        lv_obj_set_style_border_width(
+            wardriveBunnyEarL[i],
+            1,
+            0
+        );
+
+        lv_obj_set_style_border_color(
+            wardriveBunnyEarL[i],
+            lv_color_hex(0x55EEFF),
+            0
+        );
+
+        lv_obj_set_style_bg_opa(
+            wardriveBunnyEarL[i],
+            LV_OPA_TRANSP,
+            0
+        );
+
+        lv_obj_set_style_pad_all(
+            wardriveBunnyEarL[i],
+            0,
+            0
+        );
+
+        lv_obj_clear_flag(
+            wardriveBunnyEarL[i],
+            LV_OBJ_FLAG_SCROLLABLE
+        );
+
+        // Right ear
+        wardriveBunnyEarR[i] =
+            lv_obj_create(wardriveFeedScroll);
+
+        lv_obj_set_size(
+            wardriveBunnyEarR[i],
+            3,
+            7
+        );
+
+        lv_obj_set_pos(
+            wardriveBunnyEarR[i],
+            207,
+            y
+        );
+
+        lv_obj_set_style_radius(
+            wardriveBunnyEarR[i],
+            2,
+            0
+        );
+
+        lv_obj_set_style_border_width(
+            wardriveBunnyEarR[i],
+            1,
+            0
+        );
+
+        lv_obj_set_style_border_color(
+            wardriveBunnyEarR[i],
+            lv_color_hex(0x55EEFF),
+            0
+        );
+
+        lv_obj_set_style_bg_opa(
+            wardriveBunnyEarR[i],
+            LV_OPA_TRANSP,
+            0
+        );
+
+        lv_obj_set_style_pad_all(
+            wardriveBunnyEarR[i],
+            0,
+            0
+        );
+
+        lv_obj_clear_flag(
+            wardriveBunnyEarR[i],
+            LV_OBJ_FLAG_SCROLLABLE
+        );
+    }
+
+    lv_obj_t *feedUp = lv_button_create(wardriveFeedScroll);
+    lv_obj_set_size(feedUp, 34, 32);
+    lv_obj_set_pos(feedUp, 188, 5);
+    lv_obj_set_style_radius(feedUp, 9, 0);
+    lv_obj_set_style_bg_color(feedUp, lv_color_hex(0x101A2A), 0);
+    lv_obj_set_style_border_width(feedUp, 1, 0);
+    lv_obj_set_style_border_color(feedUp, lv_color_hex(0x55EEFF), 0);
+    lv_obj_add_event_cb(
+        feedUp,
+        wardriveFeedPageEvent,
+        LV_EVENT_CLICKED,
+        reinterpret_cast<void *>(static_cast<intptr_t>(-1))
+    );
+    lv_obj_t *feedUpText = lv_label_create(feedUp);
+    lv_label_set_text(feedUpText, LV_SYMBOL_UP);
+    lv_obj_set_style_text_color(feedUpText, lv_color_hex(0x55EEFF), 0);
+    lv_obj_center(feedUpText);
+
+    lv_obj_t *feedDown = lv_button_create(wardriveFeedScroll);
+    lv_obj_set_size(feedDown, 34, 32);
+    lv_obj_set_pos(feedDown, 188, 120);
+    lv_obj_set_style_radius(feedDown, 9, 0);
+    lv_obj_set_style_bg_color(feedDown, lv_color_hex(0x101A2A), 0);
+    lv_obj_set_style_border_width(feedDown, 1, 0);
+    lv_obj_set_style_border_color(feedDown, lv_color_hex(0xFF52C8), 0);
+    lv_obj_add_event_cb(
+        feedDown,
+        wardriveFeedPageEvent,
+        LV_EVENT_CLICKED,
+        reinterpret_cast<void *>(static_cast<intptr_t>(1))
+    );
+    lv_obj_t *feedDownText = lv_label_create(feedDown);
+    lv_label_set_text(feedDownText, LV_SYMBOL_DOWN);
+    lv_obj_set_style_text_color(feedDownText, lv_color_hex(0xFF52C8), 0);
+    lv_obj_center(feedDownText);
+
+    wardriveFeedPageLabel = lv_label_create(wardriveFeedScroll);
+
+    // The feed is a rolling live window, not a session-total counter.
+    // Hide this legacy page-position label so "/120" cannot be confused
+    // with the total number of discovered devices.
+    lv_label_set_text(wardriveFeedPageLabel, "");
+    lv_obj_add_flag(wardriveFeedPageLabel, LV_OBJ_FLAG_HIDDEN);
+
+    lv_obj_set_width(wardriveFeedPageLabel, 44);
+    lv_obj_set_style_text_align(
+        wardriveFeedPageLabel,
+        LV_TEXT_ALIGN_CENTER,
+        0
+    );
+    lv_obj_set_style_text_color(
+        wardriveFeedPageLabel,
+        lv_color_hex(0xAFC2D8),
+        0
+    );
+    lv_obj_set_style_text_font(
+        wardriveFeedPageLabel,
+        &lv_font_montserrat_10,
+        0
+    );
+    lv_obj_set_pos(wardriveFeedPageLabel, 182, 79);
+
+    // Legacy single-label pointer intentionally unused in fixed-page mode.
+    wardriveFeedLabel = nullptr;
 
     wardriveLocationLabel = lv_label_create(sessionCard);
     lv_label_set_text(wardriveLocationLabel, "GPS SEARCHING\n--.----\n--.----");
@@ -12493,9 +14781,13 @@ void showWardrivePage()
     lv_obj_set_pos(wardriveSdLabel, 248, 118);
 
     lv_obj_t *startBtn = lv_button_create(screen);
-    lv_obj_set_size(startBtn, 180, 48);
-    lv_obj_set_pos(startBtn, 115, 342);
-    lv_obj_set_style_radius(startBtn, 16, 0);
+
+    // Compact Wardrive START/STOP control.
+    // Positioned beneath the SD-status side of the session card,
+    // with extra separation from the feed DOWN button.
+    lv_obj_set_size(startBtn, 86, 34);
+    lv_obj_set_pos(startBtn, 288, 342);
+    lv_obj_set_style_radius(startBtn, 12, 0);
     lv_obj_set_style_bg_color(startBtn, lv_color_hex(0x0B1A1C), 0);
     lv_obj_set_style_border_width(startBtn, 1, 0);
     lv_obj_set_style_border_color(startBtn, lv_color_hex(0x7CFF45), 0);
@@ -12504,7 +14796,11 @@ void showWardrivePage()
     wardriveStartLabel = lv_label_create(startBtn);
     lv_label_set_text(wardriveStartLabel, "START");
     lv_obj_set_style_text_color(wardriveStartLabel, lv_color_hex(0x7CFF45), 0);
-    lv_obj_set_style_text_font(wardriveStartLabel, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(
+        wardriveStartLabel,
+        &lv_font_montserrat_14,
+        0
+    );
     lv_obj_center(wardriveStartLabel);
 
     lv_obj_t *bannerFrame = lv_obj_create(screen);
@@ -12564,6 +14860,8 @@ void showWardrivePage()
     wardriveUiSyncCursor = 0;
     wardriveLastDiagMs = 0;
     wardriveRecordCount = 0;
+    wardriveFeedPageStart = 0;
+    wardriveFeedFollowLatest = true;
     m33kSdReady = instance.isCardReady();
     for (auto &rec : wardriveRecords) rec = WardriveRecord{};
     wardriveFeedDirty = true;
@@ -13796,6 +16094,1609 @@ void showSignalHunterPage()
 }
 
 
+
+void mapOpenEvent(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED || !clickAllowed()) return;
+    noteActivity();
+    hapticTap();
+    mapOpenPending = true;
+}
+
+void mapBackEvent(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED || !clickAllowed()) return;
+    noteActivity();
+    hapticTap();
+    mapBackToGpsPending = true;
+}
+
+void refreshMapShellZoom()
+{
+    if (!mapViewport) return;
+
+    // Temporary visual-only grid scaling. Real map tiles will replace this
+    // shell, but zoom should already give immediate visual feedback.
+    const int spacing = 28 + (static_cast<int>(mapZoomLevel) - 14) * 12;
+    const int cx = 175;
+    const int cy = 146;
+
+    for (int i = 0; i < 7; ++i) {
+        const int offset = (i - 3) * spacing;
+
+        if (mapGridVertical[i]) {
+            lv_obj_set_pos(mapGridVertical[i], cx + offset, 10);
+        }
+        if (mapGridHorizontal[i]) {
+            lv_obj_set_pos(mapGridHorizontal[i], 10, cy + offset);
+        }
+    }
+
+    if (mapZoomLabel) {
+        lv_label_set_text_fmt(
+            mapZoomLabel,
+            "ZOOM %u",
+            (unsigned)mapZoomLevel
+        );
+    }
+}
+
+void mapZoomEvent(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED || !clickAllowed()) return;
+
+    const intptr_t delta =
+        reinterpret_cast<intptr_t>(lv_event_get_user_data(e));
+
+    int next = static_cast<int>(mapZoomLevel) + static_cast<int>(delta);
+    next = constrain(next, 14, 18);
+    mapZoomLevel = static_cast<uint8_t>(next);
+
+    refreshMapShellZoom();
+    mapLoadedTileZ = -1;
+    mapTileReloadPending = true;
+
+    noteActivity();
+    hapticTap();
+}
+
+bool mapSdFolderReady()
+{
+    if (!ensureM33KSdReady()) return false;
+
+    bool ready = false;
+    if (instance.lockSPI(pdMS_TO_TICKS(250))) {
+        if (!SD.exists("/M33KX/MAPS")) {
+            SD.mkdir("/M33KX/MAPS");
+        }
+        ready = SD.exists("/M33KX/MAPS");
+        instance.unlockSPI();
+    }
+    return ready;
+}
+
+bool mapGpsToTile(
+    double lat,
+    double lon,
+    uint8_t zoom,
+    int32_t &tileX,
+    int32_t &tileY,
+    uint16_t &pixelX,
+    uint16_t &pixelY)
+{
+    lat = constrain(lat, -85.05112878, 85.05112878);
+    lon = constrain(lon, -180.0, 180.0);
+
+    const double n = static_cast<double>(1UL << zoom);
+    const double xFloat = ((lon + 180.0) / 360.0) * n;
+
+    const double latRad = lat * PI / 180.0;
+    const double mercator =
+        log(tan(latRad) + (1.0 / cos(latRad)));
+    const double yFloat =
+        (1.0 - mercator / PI) * 0.5 * n;
+
+    tileX = static_cast<int32_t>(floor(xFloat));
+    tileY = static_cast<int32_t>(floor(yFloat));
+
+    const int32_t maxTile = static_cast<int32_t>((1UL << zoom) - 1UL);
+    tileX = constrain(tileX, 0L, maxTile);
+    tileY = constrain(tileY, 0L, maxTile);
+
+    const double fracX = xFloat - floor(xFloat);
+    const double fracY = yFloat - floor(yFloat);
+    pixelX = static_cast<uint16_t>(
+        constrain(static_cast<int>(fracX * MAP_TILE_SIZE), 0, 255)
+    );
+    pixelY = static_cast<uint16_t>(
+        constrain(static_cast<int>(fracY * MAP_TILE_SIZE), 0, 255)
+    );
+
+    return true;
+}
+
+String mapTilePath(uint8_t zoom, int32_t tileX, int32_t tileY)
+{
+    String path;
+    path.reserve(54);
+    path += "/M33KX/MAPS/";
+    path += String(zoom);
+    path += "/";
+    path += String(tileX);
+    path += "/";
+    path += String(tileY);
+    path += ".rgb565";
+    return path;
+}
+
+void mapSetPlaceholder(const String &text, uint32_t color)
+{
+    if (!mapTilePlaceholder) return;
+
+    lv_label_set_text(mapTilePlaceholder, text.c_str());
+    lv_obj_set_style_text_color(
+        mapTilePlaceholder,
+        lv_color_hex(color),
+        0
+    );
+    lv_obj_remove_flag(mapTilePlaceholder, LV_OBJ_FLAG_HIDDEN);
+}
+
+bool mapCopyTileRegion(
+    uint8_t zoom,
+    int32_t tileX,
+    int32_t tileY,
+    int32_t viewWorldLeft,
+    int32_t viewWorldTop,
+    size_t &tilesLoaded,
+    size_t &tilesMissing)
+{
+    const int32_t tileWorldLeft = tileX * MAP_TILE_SIZE;
+    const int32_t tileWorldTop = tileY * MAP_TILE_SIZE;
+    const int32_t srcX0 = max(0L, viewWorldLeft - tileWorldLeft);
+    const int32_t srcY0 = max(0L, viewWorldTop - tileWorldTop);
+    const int32_t srcX1 = min(
+        static_cast<int32_t>(MAP_TILE_SIZE),
+        viewWorldLeft + static_cast<int32_t>(MAP_VIEW_WIDTH) - tileWorldLeft
+    );
+    const int32_t srcY1 = min(
+        static_cast<int32_t>(MAP_TILE_SIZE),
+        viewWorldTop + static_cast<int32_t>(MAP_VIEW_HEIGHT) - tileWorldTop
+    );
+
+    if (srcX1 <= srcX0 || srcY1 <= srcY0) return true;
+
+    const String path = mapTilePath(zoom, tileX, tileY);
+    File file = SD.open(path.c_str(), FILE_READ);
+    if (!file || static_cast<size_t>(file.size()) != MAP_TILE_BYTES) {
+        if (file) file.close();
+        ++tilesMissing;
+        Serial.printf("[M33K MAP] missing stitched tile %s\n", path.c_str());
+        return false;
+    }
+
+    const size_t copyWidth =
+        static_cast<size_t>(srcX1 - srcX0) * 2U;
+    bool ok = true;
+
+    for (int32_t srcY = srcY0; srcY < srcY1; ++srcY) {
+        const int32_t worldY = tileWorldTop + srcY;
+        const int32_t dstY = worldY - viewWorldTop;
+        const int32_t worldX = tileWorldLeft + srcX0;
+        const int32_t dstX = worldX - viewWorldLeft;
+
+        const size_t sourceOffset =
+            (static_cast<size_t>(srcY) * MAP_TILE_SIZE +
+             static_cast<size_t>(srcX0)) * 2U;
+        const size_t destinationOffset =
+            (static_cast<size_t>(dstY) * MAP_VIEW_WIDTH +
+             static_cast<size_t>(dstX)) * 2U;
+
+        if (!file.seek(sourceOffset) ||
+            file.read(mapTileBuffer + destinationOffset, copyWidth) != copyWidth) {
+            ok = false;
+            break;
+        }
+    }
+
+    file.close();
+
+    if (ok) {
+        ++tilesLoaded;
+    } else {
+        ++tilesMissing;
+        Serial.printf("[M33K MAP] stitched tile read failed %s\n", path.c_str());
+    }
+
+    return ok;
+}
+
+
+uint16_t mapRgb565(uint8_t r, uint8_t g, uint8_t b)
+{
+    return static_cast<uint16_t>(
+        ((static_cast<uint16_t>(r) & 0xF8U) << 8) |
+        ((static_cast<uint16_t>(g) & 0xFCU) << 3) |
+        (static_cast<uint16_t>(b) >> 3)
+    );
+}
+
+void mapClearVectorBuffer()
+{
+    if (!mapTileBuffer) return;
+
+    const uint16_t bg = mapRgb565(18, 23, 29);
+    uint16_t *pixels = reinterpret_cast<uint16_t *>(mapTileBuffer);
+    const size_t count =
+        static_cast<size_t>(MAP_VIEW_WIDTH) * MAP_VIEW_HEIGHT;
+
+    for (size_t i = 0; i < count; ++i) {
+        pixels[i] = bg;
+    }
+}
+
+uint8_t mapLineOutCode(int32_t x, int32_t y)
+{
+    uint8_t code = 0;
+    if (x < 0) code |= 1;
+    else if (x >= MAP_VIEW_WIDTH) code |= 2;
+    if (y < 0) code |= 4;
+    else if (y >= MAP_VIEW_HEIGHT) code |= 8;
+    return code;
+}
+
+bool mapClipLine(
+    int32_t &x0,
+    int32_t &y0,
+    int32_t &x1,
+    int32_t &y1)
+{
+    uint8_t code0 = mapLineOutCode(x0, y0);
+    uint8_t code1 = mapLineOutCode(x1, y1);
+
+    while (true) {
+        if ((code0 | code1) == 0) return true;
+        if ((code0 & code1) != 0) return false;
+
+        const uint8_t out = code0 ? code0 : code1;
+        int32_t x = 0;
+        int32_t y = 0;
+
+        if (out & 8) {
+            if (y1 == y0) return false;
+            y = MAP_VIEW_HEIGHT - 1;
+            x = x0 + static_cast<int32_t>(
+                static_cast<int64_t>(x1 - x0) *
+                static_cast<int64_t>(y - y0) /
+                static_cast<int64_t>(y1 - y0)
+            );
+        } else if (out & 4) {
+            if (y1 == y0) return false;
+            y = 0;
+            x = x0 + static_cast<int32_t>(
+                static_cast<int64_t>(x1 - x0) *
+                static_cast<int64_t>(y - y0) /
+                static_cast<int64_t>(y1 - y0)
+            );
+        } else if (out & 2) {
+            if (x1 == x0) return false;
+            x = MAP_VIEW_WIDTH - 1;
+            y = y0 + static_cast<int32_t>(
+                static_cast<int64_t>(y1 - y0) *
+                static_cast<int64_t>(x - x0) /
+                static_cast<int64_t>(x1 - x0)
+            );
+        } else {
+            if (x1 == x0) return false;
+            x = 0;
+            y = y0 + static_cast<int32_t>(
+                static_cast<int64_t>(y1 - y0) *
+                static_cast<int64_t>(x - x0) /
+                static_cast<int64_t>(x1 - x0)
+            );
+        }
+
+        if (out == code0) {
+            x0 = x;
+            y0 = y;
+            code0 = mapLineOutCode(x0, y0);
+        } else {
+            x1 = x;
+            y1 = y;
+            code1 = mapLineOutCode(x1, y1);
+        }
+    }
+}
+
+void mapPlotVectorPixel(int32_t x, int32_t y, uint16_t color)
+{
+    if (!mapTileBuffer ||
+        x < 0 || x >= MAP_VIEW_WIDTH ||
+        y < 0 || y >= MAP_VIEW_HEIGHT) {
+        return;
+    }
+
+    uint16_t *pixels = reinterpret_cast<uint16_t *>(mapTileBuffer);
+    pixels[
+        static_cast<size_t>(y) * MAP_VIEW_WIDTH +
+        static_cast<size_t>(x)
+    ] = color;
+}
+
+void mapDrawVectorLine(
+    int32_t x0,
+    int32_t y0,
+    int32_t x1,
+    int32_t y1,
+    uint16_t color,
+    uint8_t width)
+{
+    if (!mapClipLine(x0, y0, x1, y1)) return;
+
+    const int32_t dx = abs(x1 - x0);
+    const int32_t sx = x0 < x1 ? 1 : -1;
+    const int32_t dy = -abs(y1 - y0);
+    const int32_t sy = y0 < y1 ? 1 : -1;
+    int32_t err = dx + dy;
+    const int32_t radius = max(0, static_cast<int>(width) / 2);
+
+    while (true) {
+        for (int32_t oy = -radius; oy <= radius; ++oy) {
+            for (int32_t ox = -radius; ox <= radius; ++ox) {
+                mapPlotVectorPixel(x0 + ox, y0 + oy, color);
+            }
+        }
+
+        if (x0 == x1 && y0 == y1) break;
+
+        const int32_t e2 = 2 * err;
+        if (e2 >= dy) {
+            err += dy;
+            x0 += sx;
+        }
+        if (e2 <= dx) {
+            err += dx;
+            y0 += sy;
+        }
+    }
+}
+
+bool mapLatLonToWorldPixel(
+    double lat,
+    double lon,
+    uint8_t zoom,
+    int32_t &worldX,
+    int32_t &worldY)
+{
+    lat = constrain(lat, -85.05112878, 85.05112878);
+    lon = constrain(lon, -180.0, 180.0);
+
+    const double scale =
+        static_cast<double>(MAP_TILE_SIZE) *
+        static_cast<double>(1UL << zoom);
+    const double x = ((lon + 180.0) / 360.0) * scale;
+
+    const double latRad = lat * PI / 180.0;
+    const double mercator =
+        log(tan(latRad) + (1.0 / cos(latRad)));
+    const double y =
+        (1.0 - mercator / PI) * 0.5 * scale;
+
+    worldX = static_cast<int32_t>(lround(x));
+    worldY = static_cast<int32_t>(lround(y));
+    return true;
+}
+
+void mapVectorRoadStyle(
+    uint8_t roadClass,
+    uint8_t zoom,
+    uint16_t &color,
+    uint8_t &width)
+{
+    switch (roadClass) {
+        case 0:
+            color = mapRgb565(238, 126, 107);
+            width = zoom >= 17 ? 5 : 4;
+            break;
+        case 1:
+            color = mapRgb565(220, 183, 91);
+            width = zoom >= 17 ? 4 : 3;
+            break;
+        case 2:
+            color = mapRgb565(220, 183, 91);
+            width = zoom >= 17 ? 3 : 2;
+            break;
+        case 3:
+            color = mapRgb565(194, 197, 201);
+            width = zoom >= 17 ? 3 : 2;
+            break;
+        case 4:
+            color = mapRgb565(126, 132, 139);
+            width = zoom >= 17 ? 2 : 1;
+            break;
+        case 5:
+            color = mapRgb565(104, 111, 119);
+            width = 1;
+            break;
+        default:
+            color = mapRgb565(82, 91, 84);
+            width = 1;
+            break;
+    }
+}
+
+
+String mapVectorV2ChunkPath(int32_t chunkX, int32_t chunkY)
+{
+    String path;
+    path.reserve(64);
+    path += MAP_VECTOR_V2_ROOT;
+    path += "/";
+    path += String(MAP_VECTOR_V2_CHUNK_ZOOM);
+    path += "/";
+    path += String(chunkX);
+    path += "/";
+    path += String(chunkY);
+    path += ".m33kc";
+    return path;
+}
+
+void mapResetVectorLabelCandidates()
+{
+    for (uint8_t i = 0; i < MAP_VECTOR_LABEL_COUNT; ++i) {
+        mapVectorLabelText[i] = "";
+        mapVectorLabelX[i] = 0;
+        mapVectorLabelY[i] = 0;
+        mapVectorLabelPriority[i] = 255;
+    }
+}
+
+void mapHideVectorLabels()
+{
+    for (auto *label : mapVectorLabels) {
+        if (label) lv_obj_add_flag(label, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+bool mapVectorRoadVisibleAtZoom(uint8_t roadClass, uint8_t zoom)
+{
+    if (zoom <= 14) return roadClass <= 3;
+    if (zoom == 15) return roadClass <= 4;
+    if (zoom == 16) return roadClass <= 5;
+    return roadClass <= 6;
+}
+
+bool mapVectorLabelAllowedAtZoom(uint8_t roadClass, uint8_t zoom)
+{
+    if (zoom <= 14) return roadClass <= 2;
+    if (zoom == 15) return roadClass <= 3;
+    if (zoom == 16) return roadClass <= 4;
+    return roadClass <= 5;
+}
+
+void mapOfferVectorLabel(
+    const String &text,
+    uint8_t priority,
+    int16_t x,
+    int16_t y)
+{
+    if (text.length() == 0 ||
+        x < 24 || x > MAP_VIEW_WIDTH - 24 ||
+        y < 12 || y > MAP_VIEW_HEIGHT - 12) {
+        return;
+    }
+
+    for (uint8_t i = 0; i < MAP_VECTOR_LABEL_COUNT; ++i) {
+        if (mapVectorLabelText[i] == text) return;
+    }
+
+    int bestSlot = -1;
+    uint8_t worstPriority = 0;
+
+    for (uint8_t i = 0; i < MAP_VECTOR_LABEL_COUNT; ++i) {
+        if (mapVectorLabelText[i].length() == 0) {
+            bestSlot = i;
+            break;
+        }
+
+        if (mapVectorLabelPriority[i] >= worstPriority) {
+            worstPriority = mapVectorLabelPriority[i];
+            bestSlot = i;
+        }
+    }
+
+    if (bestSlot < 0) return;
+
+    if (mapVectorLabelText[bestSlot].length() != 0 &&
+        priority >= mapVectorLabelPriority[bestSlot]) {
+        return;
+    }
+
+    mapVectorLabelText[bestSlot] = text;
+    mapVectorLabelPriority[bestSlot] = priority;
+    mapVectorLabelX[bestSlot] = x;
+    mapVectorLabelY[bestSlot] = y;
+}
+
+void mapApplyVectorLabels()
+{
+    for (uint8_t i = 0; i < MAP_VECTOR_LABEL_COUNT; ++i) {
+        lv_obj_t *label = mapVectorLabels[i];
+        if (!label) continue;
+
+        if (mapVectorLabelText[i].length() == 0) {
+            lv_obj_add_flag(label, LV_OBJ_FLAG_HIDDEN);
+            continue;
+        }
+
+        lv_label_set_text(label, mapVectorLabelText[i].c_str());
+        lv_obj_set_pos(
+            label,
+            mapVectorLabelX[i],
+            mapVectorLabelY[i]
+        );
+        lv_obj_remove_flag(label, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+bool mapLoadVectorV2Chunk(
+    const String &path,
+    int32_t viewLeft,
+    int32_t viewTop,
+    size_t &featuresDrawn,
+    size_t &segmentsDrawn)
+{
+    File file = SD.open(path.c_str(), FILE_READ);
+    if (!file) return false;
+
+    uint8_t magic[8] = {};
+    uint32_t featureCount = 0;
+
+    const bool headerOk =
+        file.read(magic, sizeof(magic)) == sizeof(magic) &&
+        file.read(
+            reinterpret_cast<uint8_t *>(&featureCount),
+            sizeof(featureCount)
+        ) == sizeof(featureCount) &&
+        memcmp(magic, "M33KC2\0\0", 8) == 0;
+
+    if (!headerOk || featureCount > 100000U) {
+        file.close();
+        Serial.printf(
+            "[M33K MAP] invalid v2 chunk %s\n",
+            path.c_str()
+        );
+        return false;
+    }
+
+    const uint8_t zoom =
+        static_cast<uint8_t>(mapRequestedTileZ);
+
+    for (uint32_t featureIndex = 0;
+         featureIndex < featureCount;
+         ++featureIndex) {
+        uint8_t roadClass = 0;
+        uint8_t flags = 0;
+        uint8_t nameLen = 0;
+        uint8_t reserved = 0;
+        uint16_t pointCount = 0;
+
+        if (file.read(&roadClass, 1) != 1 ||
+            file.read(&flags, 1) != 1 ||
+            file.read(&nameLen, 1) != 1 ||
+            file.read(&reserved, 1) != 1 ||
+            file.read(
+                reinterpret_cast<uint8_t *>(&pointCount),
+                sizeof(pointCount)
+            ) != sizeof(pointCount)) {
+            file.close();
+            return false;
+        }
+
+        if (nameLen > 39 || pointCount < 2 || pointCount > 8192) {
+            file.close();
+            return false;
+        }
+
+        char nameBuffer[40] = {};
+        if (nameLen > 0 &&
+            file.read(
+                reinterpret_cast<uint8_t *>(nameBuffer),
+                nameLen
+            ) != nameLen) {
+            file.close();
+            return false;
+        }
+        nameBuffer[nameLen] = '\0';
+
+        if (!mapVectorRoadVisibleAtZoom(roadClass, zoom)) {
+            const size_t skipBytes =
+                static_cast<size_t>(pointCount) * 8U;
+            if (!file.seek(file.position() + skipBytes)) {
+                file.close();
+                return false;
+            }
+            continue;
+        }
+
+        uint16_t color = 0;
+        uint8_t width = 1;
+        mapVectorRoadStyle(roadClass, zoom, color, width);
+
+        int32_t previousX = 0;
+        int32_t previousY = 0;
+        bool havePrevious = false;
+        bool featureTouched = false;
+        int16_t labelX = 0;
+        int16_t labelY = 0;
+
+        for (uint16_t pointIndex = 0;
+             pointIndex < pointCount;
+             ++pointIndex) {
+            int32_t latE7 = 0;
+            int32_t lonE7 = 0;
+
+            if (file.read(
+                    reinterpret_cast<uint8_t *>(&latE7),
+                    sizeof(latE7)
+                ) != sizeof(latE7) ||
+                file.read(
+                    reinterpret_cast<uint8_t *>(&lonE7),
+                    sizeof(lonE7)
+                ) != sizeof(lonE7)) {
+                file.close();
+                return false;
+            }
+
+            int32_t worldX = 0;
+            int32_t worldY = 0;
+            mapLatLonToWorldPixel(
+                static_cast<double>(latE7) / 10000000.0,
+                static_cast<double>(lonE7) / 10000000.0,
+                zoom,
+                worldX,
+                worldY
+            );
+
+            const int32_t screenX = worldX - viewLeft;
+            const int32_t screenY = worldY - viewTop;
+
+            if (havePrevious) {
+                int32_t x0 = previousX;
+                int32_t y0 = previousY;
+                int32_t x1 = screenX;
+                int32_t y1 = screenY;
+
+                if (mapClipLine(x0, y0, x1, y1)) {
+                    mapDrawVectorLine(
+                        previousX,
+                        previousY,
+                        screenX,
+                        screenY,
+                        color,
+                        width
+                    );
+                    featureTouched = true;
+                    ++segmentsDrawn;
+
+                    if (labelX == 0 && labelY == 0) {
+                        labelX = static_cast<int16_t>((x0 + x1) / 2);
+                        labelY = static_cast<int16_t>((y0 + y1) / 2);
+                    }
+                }
+            }
+
+            previousX = screenX;
+            previousY = screenY;
+            havePrevious = true;
+        }
+
+        if (featureTouched) {
+            ++featuresDrawn;
+
+            if (nameLen > 0 &&
+                mapVectorLabelAllowedAtZoom(roadClass, zoom)) {
+                mapOfferVectorLabel(
+                    String(nameBuffer),
+                    roadClass,
+                    labelX,
+                    labelY
+                );
+            }
+        }
+    }
+
+    file.close();
+    return true;
+}
+
+bool loadVectorMapV2()
+{
+    if (!mapTileBuffer ||
+        mapRequestedTileZ < 14 ||
+        mapRequestedWorldX < 0 ||
+        mapRequestedWorldY < 0) {
+        return false;
+    }
+
+    const int32_t scale =
+        1L << (
+            static_cast<uint8_t>(mapRequestedTileZ) -
+            MAP_VECTOR_V2_CHUNK_ZOOM
+        );
+
+    const int32_t viewLeft =
+        mapRequestedWorldX - static_cast<int32_t>(MAP_VIEW_WIDTH / 2);
+    const int32_t viewTop =
+        mapRequestedWorldY - static_cast<int32_t>(MAP_VIEW_HEIGHT / 2);
+    const int32_t viewRight =
+        viewLeft + static_cast<int32_t>(MAP_VIEW_WIDTH) - 1;
+    const int32_t viewBottom =
+        viewTop + static_cast<int32_t>(MAP_VIEW_HEIGHT) - 1;
+
+    const int32_t z12Left = viewLeft / scale;
+    const int32_t z12Top = viewTop / scale;
+    const int32_t z12Right = viewRight / scale;
+    const int32_t z12Bottom = viewBottom / scale;
+
+    const int32_t firstChunkX = z12Left / MAP_TILE_SIZE;
+    const int32_t firstChunkY = z12Top / MAP_TILE_SIZE;
+    const int32_t lastChunkX = z12Right / MAP_TILE_SIZE;
+    const int32_t lastChunkY = z12Bottom / MAP_TILE_SIZE;
+
+    mapClearVectorBuffer();
+    mapResetVectorLabelCandidates();
+
+    size_t chunksLoaded = 0;
+    size_t featuresDrawn = 0;
+    size_t segmentsDrawn = 0;
+
+    if (!instance.lockSPI(pdMS_TO_TICKS(1000))) {
+        return false;
+    }
+
+    for (int32_t cy = firstChunkY; cy <= lastChunkY; ++cy) {
+        for (int32_t cx = firstChunkX; cx <= lastChunkX; ++cx) {
+            const String path = mapVectorV2ChunkPath(cx, cy);
+            if (mapLoadVectorV2Chunk(
+                    path,
+                    viewLeft,
+                    viewTop,
+                    featuresDrawn,
+                    segmentsDrawn)) {
+                ++chunksLoaded;
+            }
+        }
+    }
+
+    instance.unlockSPI();
+
+    if (chunksLoaded == 0 || featuresDrawn == 0) {
+        mapHideVectorLabels();
+        return false;
+    }
+
+    mapLoadedTileZ = mapRequestedTileZ;
+    mapLoadedTileX = mapRequestedTileX;
+    mapLoadedTileY = mapRequestedTileY;
+    mapLoadedWorldX = mapRequestedWorldX;
+    mapLoadedWorldY = mapRequestedWorldY;
+    mapTileLoaded = true;
+
+    if (mapTileCanvas) {
+        lv_obj_remove_flag(mapTileCanvas, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_invalidate(mapTileCanvas);
+    }
+    if (mapTilePlaceholder) {
+        lv_obj_add_flag(mapTilePlaceholder, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    mapApplyVectorLabels();
+
+    if (mapSdLabel) {
+        lv_label_set_text_fmt(
+            mapSdLabel,
+            "VECTOR V2  %u CHUNK%s  %u ROADS",
+            (unsigned)chunksLoaded,
+            chunksLoaded == 1 ? "" : "S",
+            (unsigned)featuresDrawn
+        );
+        lv_obj_set_style_text_color(
+            mapSdLabel,
+            lv_color_hex(0x55EEFF),
+            0
+        );
+    }
+
+    Serial.printf(
+        "[M33K MAP] vector v2 z%d chunks=%u roads=%u segments=%u\n",
+        (int)mapLoadedTileZ,
+        (unsigned)chunksLoaded,
+        (unsigned)featuresDrawn,
+        (unsigned)segmentsDrawn
+    );
+
+    return true;
+}
+
+bool loadVectorPrototypeMap()
+{
+    if (!mapTileBuffer ||
+        mapRequestedTileZ < 0 ||
+        mapRequestedWorldX < 0 ||
+        mapRequestedWorldY < 0) {
+        return false;
+    }
+
+    bool rendered = false;
+    size_t featuresDrawn = 0;
+    size_t segmentsDrawn = 0;
+
+    if (!instance.lockSPI(pdMS_TO_TICKS(1000))) {
+        return false;
+    }
+
+    File file = SD.open(MAP_VECTOR_PROTOTYPE_PATH, FILE_READ);
+    if (!file) {
+        instance.unlockSPI();
+        return false;
+    }
+
+    uint8_t magic[8] = {};
+    uint32_t featureCount = 0;
+
+    const bool headerOk =
+        file.read(magic, sizeof(magic)) == sizeof(magic) &&
+        file.read(
+            reinterpret_cast<uint8_t *>(&featureCount),
+            sizeof(featureCount)
+        ) == sizeof(featureCount) &&
+        memcmp(magic, "M33KV1\0\0", 8) == 0;
+
+    if (!headerOk || featureCount > 200000U) {
+        file.close();
+        instance.unlockSPI();
+        Serial.println("[M33K MAP] invalid vector prototype header");
+        return false;
+    }
+
+    mapClearVectorBuffer();
+
+    const int32_t viewLeft =
+        mapRequestedWorldX - static_cast<int32_t>(MAP_VIEW_WIDTH / 2);
+    const int32_t viewTop =
+        mapRequestedWorldY - static_cast<int32_t>(MAP_VIEW_HEIGHT / 2);
+
+    for (uint32_t featureIndex = 0;
+         featureIndex < featureCount;
+         ++featureIndex) {
+        uint8_t roadClass = 0;
+        uint8_t flags = 0;
+        uint16_t pointCount = 0;
+
+        if (file.read(&roadClass, 1) != 1 ||
+            file.read(&flags, 1) != 1 ||
+            file.read(
+                reinterpret_cast<uint8_t *>(&pointCount),
+                sizeof(pointCount)
+            ) != sizeof(pointCount)) {
+            break;
+        }
+
+        if (pointCount < 2 || pointCount > 8192) {
+            file.close();
+            instance.unlockSPI();
+            Serial.println("[M33K MAP] invalid vector point count");
+            return false;
+        }
+
+        int32_t previousX = 0;
+        int32_t previousY = 0;
+        bool havePrevious = false;
+        bool featureTouched = false;
+
+        uint16_t color = 0;
+        uint8_t width = 1;
+        mapVectorRoadStyle(
+            roadClass,
+            static_cast<uint8_t>(mapRequestedTileZ),
+            color,
+            width
+        );
+
+        for (uint16_t pointIndex = 0;
+             pointIndex < pointCount;
+             ++pointIndex) {
+            int32_t latE7 = 0;
+            int32_t lonE7 = 0;
+
+            if (file.read(
+                    reinterpret_cast<uint8_t *>(&latE7),
+                    sizeof(latE7)
+                ) != sizeof(latE7) ||
+                file.read(
+                    reinterpret_cast<uint8_t *>(&lonE7),
+                    sizeof(lonE7)
+                ) != sizeof(lonE7)) {
+                file.close();
+                instance.unlockSPI();
+                return false;
+            }
+
+            int32_t worldX = 0;
+            int32_t worldY = 0;
+            mapLatLonToWorldPixel(
+                static_cast<double>(latE7) / 10000000.0,
+                static_cast<double>(lonE7) / 10000000.0,
+                static_cast<uint8_t>(mapRequestedTileZ),
+                worldX,
+                worldY
+            );
+
+            const int32_t screenX = worldX - viewLeft;
+            const int32_t screenY = worldY - viewTop;
+
+            if (havePrevious) {
+                int32_t x0 = previousX;
+                int32_t y0 = previousY;
+                int32_t x1 = screenX;
+                int32_t y1 = screenY;
+
+                if (mapClipLine(x0, y0, x1, y1)) {
+                    mapDrawVectorLine(
+                        previousX,
+                        previousY,
+                        screenX,
+                        screenY,
+                        color,
+                        width
+                    );
+                    featureTouched = true;
+                    ++segmentsDrawn;
+                }
+            }
+
+            previousX = screenX;
+            previousY = screenY;
+            havePrevious = true;
+        }
+
+        if (featureTouched) ++featuresDrawn;
+    }
+
+    file.close();
+    instance.unlockSPI();
+
+    if (featuresDrawn == 0) {
+        return false;
+    }
+
+    mapLoadedTileZ = mapRequestedTileZ;
+    mapLoadedTileX = mapRequestedTileX;
+    mapLoadedTileY = mapRequestedTileY;
+    mapLoadedWorldX = mapRequestedWorldX;
+    mapLoadedWorldY = mapRequestedWorldY;
+    mapTileLoaded = true;
+    rendered = true;
+
+    if (mapTileCanvas) {
+        lv_obj_remove_flag(mapTileCanvas, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_invalidate(mapTileCanvas);
+    }
+    if (mapTilePlaceholder) {
+        lv_obj_add_flag(mapTilePlaceholder, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    if (mapSdLabel) {
+        lv_label_set_text_fmt(
+            mapSdLabel,
+            "VECTOR MAP  %u ROADS",
+            (unsigned)featuresDrawn
+        );
+        lv_obj_set_style_text_color(
+            mapSdLabel,
+            lv_color_hex(0x55EEFF),
+            0
+        );
+    }
+
+    Serial.printf(
+        "[M33K MAP] vector prototype z%d roads=%u segments=%u\n",
+        (int)mapLoadedTileZ,
+        (unsigned)featuresDrawn,
+        (unsigned)segmentsDrawn
+    );
+
+    return rendered;
+}
+
+bool loadRequestedMapTile()
+{
+    mapTileReloadPending = false;
+
+    if (currentPage != Page::Map ||
+        mapRequestedTileZ < 0 ||
+        mapRequestedTileX < 0 ||
+        mapRequestedTileY < 0 ||
+        mapRequestedWorldX < 0 ||
+        mapRequestedWorldY < 0) {
+        return false;
+    }
+
+    if (!mapTileBuffer) {
+        mapTileBuffer = static_cast<uint8_t *>(
+            heap_caps_malloc(
+                MAP_VIEW_BYTES,
+                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT
+            )
+        );
+
+        if (!mapTileBuffer) {
+            mapSetPlaceholder("MAP ERROR\nPSRAM ALLOCATION FAILED", 0xFF667F);
+            if (mapSdLabel) {
+                lv_label_set_text(mapSdLabel, "MAP: PSRAM ALLOC FAILED");
+                lv_obj_set_style_text_color(
+                    mapSdLabel,
+                    lv_color_hex(0xFF667F),
+                    0
+                );
+            }
+            return false;
+        }
+
+        if (mapTileCanvas) {
+            lv_canvas_set_buffer(
+                mapTileCanvas,
+                mapTileBuffer,
+                MAP_VIEW_WIDTH,
+                MAP_VIEW_HEIGHT,
+                LV_COLOR_FORMAT_RGB565
+            );
+        }
+    }
+
+    if (!ensureM33KSdReady()) {
+        mapTileLoaded = false;
+        if (mapTileCanvas) {
+            lv_obj_add_flag(mapTileCanvas, LV_OBJ_FLAG_HIDDEN);
+        }
+        mapSetPlaceholder("SD OFFLINE\nNO MAP TILE", 0xFFB84D);
+        return false;
+    }
+
+    // Prefer chunked vector v2. During development, retain the flat v1
+    // prototype and proven stitched RGB565 renderer as fallbacks.
+    if (loadVectorMapV2()) {
+        return true;
+    }
+
+    if (loadVectorPrototypeMap()) {
+        return true;
+    }
+
+    mapHideVectorLabels();
+    memset(mapTileBuffer, 0, MAP_VIEW_BYTES);
+
+    const int32_t viewWorldLeft =
+        mapRequestedWorldX - static_cast<int32_t>(MAP_VIEW_WIDTH / 2);
+    const int32_t viewWorldTop =
+        mapRequestedWorldY - static_cast<int32_t>(MAP_VIEW_HEIGHT / 2);
+
+    const int32_t firstTileX =
+        static_cast<int32_t>(floor(
+            static_cast<double>(viewWorldLeft) / MAP_TILE_SIZE
+        ));
+    const int32_t firstTileY =
+        static_cast<int32_t>(floor(
+            static_cast<double>(viewWorldTop) / MAP_TILE_SIZE
+        ));
+    const int32_t lastTileX =
+        static_cast<int32_t>(floor(
+            static_cast<double>(
+                viewWorldLeft + static_cast<int32_t>(MAP_VIEW_WIDTH) - 1
+            ) / MAP_TILE_SIZE
+        ));
+    const int32_t lastTileY =
+        static_cast<int32_t>(floor(
+            static_cast<double>(
+                viewWorldTop + static_cast<int32_t>(MAP_VIEW_HEIGHT) - 1
+            ) / MAP_TILE_SIZE
+        ));
+
+    size_t tilesLoaded = 0;
+    size_t tilesMissing = 0;
+
+    if (instance.lockSPI(pdMS_TO_TICKS(1000))) {
+        for (int32_t ty = firstTileY; ty <= lastTileY; ++ty) {
+            for (int32_t tx = firstTileX; tx <= lastTileX; ++tx) {
+                mapCopyTileRegion(
+                    static_cast<uint8_t>(mapRequestedTileZ),
+                    tx,
+                    ty,
+                    viewWorldLeft,
+                    viewWorldTop,
+                    tilesLoaded,
+                    tilesMissing
+                );
+            }
+        }
+        instance.unlockSPI();
+    } else {
+        mapSetPlaceholder("MAP BUSY\nSD LOCK TIMEOUT", 0xFFB84D);
+        return false;
+    }
+
+    if (tilesLoaded == 0) {
+        mapTileLoaded = false;
+        if (mapTileCanvas) {
+            lv_obj_add_flag(mapTileCanvas, LV_OBJ_FLAG_HIDDEN);
+        }
+        mapSetPlaceholder("MAP TILES NOT FOUND\nCHECK REGIONAL PACK", 0xFFB84D);
+        if (mapSdLabel) {
+            lv_label_set_text(mapSdLabel, "MAP: NO VISIBLE TILES FOUND");
+            lv_obj_set_style_text_color(
+                mapSdLabel,
+                lv_color_hex(0xFFB84D),
+                0
+            );
+        }
+        return false;
+    }
+
+    mapLoadedTileZ = mapRequestedTileZ;
+    mapLoadedTileX = mapRequestedTileX;
+    mapLoadedTileY = mapRequestedTileY;
+    mapLoadedWorldX = mapRequestedWorldX;
+    mapLoadedWorldY = mapRequestedWorldY;
+    mapTileLoaded = true;
+
+    if (mapTileCanvas) {
+        lv_obj_remove_flag(mapTileCanvas, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_invalidate(mapTileCanvas);
+    }
+    if (mapTilePlaceholder) {
+        lv_obj_add_flag(mapTilePlaceholder, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    if (mapSdLabel) {
+        lv_label_set_text_fmt(
+            mapSdLabel,
+            "MAP STITCHED  %u TILE%s%s",
+            (unsigned)tilesLoaded,
+            tilesLoaded == 1 ? "" : "S",
+            tilesMissing ? "  |  EDGE MISSING" : ""
+        );
+        lv_obj_set_style_text_color(
+            mapSdLabel,
+            lv_color_hex(tilesMissing ? 0xFFB84D : 0x7CFF45),
+            0
+        );
+    }
+
+    Serial.printf(
+        "[M33K MAP] stitched z%d center=%ld/%ld world=%ld,%ld tiles=%u missing=%u\n",
+        (int)mapLoadedTileZ,
+        (long)mapLoadedTileX,
+        (long)mapLoadedTileY,
+        (long)mapLoadedWorldX,
+        (long)mapLoadedWorldY,
+        (unsigned)tilesLoaded,
+        (unsigned)tilesMissing
+    );
+
+    return true;
+}
+
+void updateMapUi()
+{
+    if (currentPage != Page::Map) return;
+
+    const bool haveFix =
+        gpsParser.location.isValid() &&
+        gpsParser.location.age() < 5000;
+
+    if (mapStatusLabel) {
+        if (haveFix) {
+            const unsigned sats = gpsParser.satellites.isValid()
+                ? (unsigned)gpsParser.satellites.value()
+                : 0U;
+            lv_label_set_text_fmt(
+                mapStatusLabel,
+                "GPS FIX  %u SAT  |  NORTH UP",
+                sats
+            );
+            lv_obj_set_style_text_color(
+                mapStatusLabel,
+                lv_color_hex(0x7CFF45),
+                0
+            );
+        } else {
+            lv_label_set_text(
+                mapStatusLabel,
+                "GPS SEARCHING  |  NORTH UP"
+            );
+            lv_obj_set_style_text_color(
+                mapStatusLabel,
+                lv_color_hex(0xF5FF3B),
+                0
+            );
+        }
+    }
+
+    if (mapCoordLabel) {
+        if (haveFix) {
+            lv_label_set_text_fmt(
+                mapCoordLabel,
+                "LAT %.6f\nLON %.6f",
+                gpsParser.location.lat(),
+                gpsParser.location.lng()
+            );
+        } else {
+            lv_label_set_text(
+                mapCoordLabel,
+                "LAT --.------\nLON --.------"
+            );
+        }
+    }
+
+    const bool useTestLocation =
+        !haveFix && MAP_DEV_TEST_LOCATION_ENABLED;
+
+    if (haveFix || useTestLocation) {
+        const double mapLat =
+            haveFix ? gpsParser.location.lat() : MAP_DEV_TEST_LAT;
+        const double mapLon =
+            haveFix ? gpsParser.location.lng() : MAP_DEV_TEST_LON;
+
+        int32_t tileX = -1;
+        int32_t tileY = -1;
+        uint16_t pixelX = 0;
+        uint16_t pixelY = 0;
+
+        mapGpsToTile(
+            mapLat,
+            mapLon,
+            mapZoomLevel,
+            tileX,
+            tileY,
+            pixelX,
+            pixelY
+        );
+
+        mapRequestedTileZ = static_cast<int8_t>(mapZoomLevel);
+        mapRequestedTileX = tileX;
+        mapRequestedTileY = tileY;
+        mapRequestedLat = mapLat;
+        mapRequestedLon = mapLon;
+        mapRequestedWorldX =
+            tileX * static_cast<int32_t>(MAP_TILE_SIZE) +
+            static_cast<int32_t>(pixelX);
+        mapRequestedWorldY =
+            tileY * static_cast<int32_t>(MAP_TILE_SIZE) +
+            static_cast<int32_t>(pixelY);
+
+        if (mapLoadedTileZ != mapRequestedTileZ ||
+            mapLoadedWorldX < 0 ||
+            mapLoadedWorldY < 0 ||
+            abs(mapRequestedWorldX - mapLoadedWorldX) >=
+                MAP_RELOAD_PIXEL_THRESHOLD ||
+            abs(mapRequestedWorldY - mapLoadedWorldY) >=
+                MAP_RELOAD_PIXEL_THRESHOLD) {
+            mapTileReloadPending = true;
+        }
+
+        if (mapMarkerDot) {
+            lv_obj_set_pos(
+                mapMarkerDot,
+                static_cast<int>(MAP_VIEW_WIDTH / 2) - 9,
+                static_cast<int>(MAP_VIEW_HEIGHT / 2) - 9
+            );
+            lv_obj_remove_flag(mapMarkerDot, LV_OBJ_FLAG_HIDDEN);
+        }
+
+        if (mapMarkerLabel) {
+            lv_label_set_text(
+                mapMarkerLabel,
+                haveFix ? "YOU" : "TEST"
+            );
+            lv_obj_set_pos(
+                mapMarkerLabel,
+                static_cast<int>(MAP_VIEW_WIDTH / 2) - 12,
+                static_cast<int>(MAP_VIEW_HEIGHT / 2) + 11
+            );
+            lv_obj_remove_flag(mapMarkerLabel, LV_OBJ_FLAG_HIDDEN);
+        }
+
+        if (useTestLocation && mapStatusLabel) {
+            lv_label_set_text(
+                mapStatusLabel,
+                "TEST LOCATION  |  NO GPS FIX"
+            );
+            lv_obj_set_style_text_color(
+                mapStatusLabel,
+                lv_color_hex(0x55EEFF),
+                0
+            );
+        }
+
+        if (useTestLocation && mapCoordLabel) {
+            lv_label_set_text_fmt(
+                mapCoordLabel,
+                "TEST LAT %.6f\nTEST LON %.6f",
+                mapLat,
+                mapLon
+            );
+        }
+    } else {
+        if (mapMarkerDot) {
+            lv_obj_add_flag(mapMarkerDot, LV_OBJ_FLAG_HIDDEN);
+        }
+        if (mapMarkerLabel) {
+            lv_obj_add_flag(mapMarkerLabel, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+
+    if (mapZoomLabel) {
+        lv_label_set_text_fmt(
+            mapZoomLabel,
+            "ZOOM %u",
+            (unsigned)mapZoomLevel
+        );
+    }
+}
+
+void mapTimerCb(lv_timer_t *timer)
+{
+    LV_UNUSED(timer);
+    updateMapUi();
+}
+
+void showMapPage()
+{
+    clearScreen();
+    currentPage = Page::Map;
+    mapOpenPending = false;
+    mapBackToGpsPending = false;
+    mapTileReloadPending = false;
+    mapTileLoaded = false;
+    mapLoadedTileX = -1;
+    mapLoadedTileY = -1;
+    mapLoadedTileZ = -1;
+    mapRequestedTileX = -1;
+    mapRequestedTileY = -1;
+    mapRequestedTileZ = -1;
+    mapLoadedWorldX = -1;
+    mapLoadedWorldY = -1;
+    mapRequestedWorldX = -1;
+    mapRequestedWorldY = -1;
+
+    ensureGpsReady();
+    gpsToolActive = true;
+
+    createSafeHeaderBack(mapBackEvent);
+
+    lv_obj_t *title = lv_label_create(screen);
+    lv_label_set_text(title, LV_SYMBOL_GPS "  M33K MAP");
+    lv_obj_set_style_text_color(title, lv_color_hex(0x55EEFF), 0);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 8, 26);
+
+    // Map viewport shell. Raster SD tiles will be drawn into this area in the
+    // next milestone; keeping the viewport isolated makes tile replacement
+    // independent from the status/controls below.
+    mapViewport = lv_obj_create(screen);
+    lv_obj_set_size(mapViewport, 350, 292);
+    lv_obj_set_pos(mapViewport, 30, 78);
+    lv_obj_set_style_radius(mapViewport, 18, 0);
+    lv_obj_set_style_bg_color(mapViewport, lv_color_hex(0x061019), 0);
+    lv_obj_set_style_bg_opa(mapViewport, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(mapViewport, 1, 0);
+    lv_obj_set_style_border_color(mapViewport, lv_color_hex(0x234460), 0);
+    lv_obj_set_style_pad_all(mapViewport, 0, 0);
+    lv_obj_clear_flag(mapViewport, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_clip_corner(mapViewport, true, 0);
+
+    mapTileCanvas = lv_canvas_create(mapViewport);
+    lv_obj_set_size(mapTileCanvas, MAP_VIEW_WIDTH, MAP_VIEW_HEIGHT);
+    lv_obj_set_pos(mapTileCanvas, 0, 0);
+    lv_obj_clear_flag(mapTileCanvas, LV_OBJ_FLAG_SCROLLABLE);
+    // Never show the canvas until valid tile bytes have been loaded. Its
+    // external PSRAM buffer is intentionally allocated lazily, so displaying
+    // it before the first successful read can expose uninitialized pixels.
+    lv_obj_add_flag(mapTileCanvas, LV_OBJ_FLAG_HIDDEN);
+
+    // Fallback grid stays behind the marker until a tile loads.
+    for (int i = 0; i < 7; ++i) {
+        mapGridVertical[i] = lv_obj_create(mapViewport);
+        lv_obj_remove_style_all(mapGridVertical[i]);
+        lv_obj_set_size(mapGridVertical[i], 1, 270);
+        lv_obj_set_style_bg_color(
+            mapGridVertical[i],
+            lv_color_hex(0x163247),
+            0
+        );
+        lv_obj_set_style_bg_opa(mapGridVertical[i], 120, 0);
+
+        mapGridHorizontal[i] = lv_obj_create(mapViewport);
+        lv_obj_remove_style_all(mapGridHorizontal[i]);
+        lv_obj_set_size(mapGridHorizontal[i], 330, 1);
+        lv_obj_set_style_bg_color(
+            mapGridHorizontal[i],
+            lv_color_hex(0x163247),
+            0
+        );
+        lv_obj_set_style_bg_opa(mapGridHorizontal[i], 120, 0);
+    }
+
+    for (uint8_t i = 0; i < MAP_VECTOR_LABEL_COUNT; ++i) {
+        mapVectorLabels[i] = lv_label_create(mapViewport);
+        lv_label_set_text(mapVectorLabels[i], "");
+        lv_obj_set_style_text_color(
+            mapVectorLabels[i],
+            lv_color_hex(0xFFFFFF),
+            0
+        );
+        lv_obj_set_style_text_font(
+            mapVectorLabels[i],
+            &lv_font_montserrat_12,
+            0
+        );
+        lv_obj_set_style_bg_color(
+            mapVectorLabels[i],
+            lv_color_hex(0x071019),
+            0
+        );
+        lv_obj_set_style_bg_opa(
+            mapVectorLabels[i],
+            LV_OPA_70,
+            0
+        );
+        lv_obj_set_style_pad_left(mapVectorLabels[i], 2, 0);
+        lv_obj_set_style_pad_right(mapVectorLabels[i], 2, 0);
+        lv_obj_set_style_pad_top(mapVectorLabels[i], 1, 0);
+        lv_obj_set_style_pad_bottom(mapVectorLabels[i], 1, 0);
+        lv_obj_set_style_radius(mapVectorLabels[i], 3, 0);
+        lv_obj_add_flag(mapVectorLabels[i], LV_OBJ_FLAG_HIDDEN);
+    }
+
+    mapTilePlaceholder = lv_label_create(mapViewport);
+    lv_label_set_text(
+        mapTilePlaceholder,
+        "WAITING FOR GPS\nOFFLINE RGB565 TILES"
+    );
+    lv_obj_set_width(mapTilePlaceholder, 300);
+    lv_obj_set_style_text_align(
+        mapTilePlaceholder,
+        LV_TEXT_ALIGN_CENTER,
+        0
+    );
+    lv_obj_set_style_text_color(
+        mapTilePlaceholder,
+        lv_color_hex(0x5A7892),
+        0
+    );
+    lv_obj_set_style_text_font(
+        mapTilePlaceholder,
+        &lv_font_montserrat_12,
+        0
+    );
+    lv_obj_align(mapTilePlaceholder, LV_ALIGN_TOP_MID, 0, 18);
+
+    mapMarkerDot = lv_obj_create(mapViewport);
+    lv_obj_remove_style_all(mapMarkerDot);
+    lv_obj_set_size(mapMarkerDot, 18, 18);
+    lv_obj_set_style_radius(mapMarkerDot, 9, 0);
+    lv_obj_set_style_bg_color(mapMarkerDot, lv_color_hex(0x55EEFF), 0);
+    lv_obj_set_style_bg_opa(mapMarkerDot, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(mapMarkerDot, 3, 0);
+    lv_obj_set_style_border_color(mapMarkerDot, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_add_flag(mapMarkerDot, LV_OBJ_FLAG_HIDDEN);
+
+    mapMarkerLabel = lv_label_create(mapViewport);
+    lv_label_set_text(mapMarkerLabel, "YOU");
+    lv_obj_set_style_text_color(
+        mapMarkerLabel,
+        lv_color_hex(0xFFFFFF),
+        0
+    );
+    lv_obj_set_style_text_font(
+        mapMarkerLabel,
+        &lv_font_montserrat_12,
+        0
+    );
+    lv_obj_align(mapMarkerLabel, LV_ALIGN_CENTER, 0, 24);
+    lv_obj_add_flag(mapMarkerLabel, LV_OBJ_FLAG_HIDDEN);
+
+    mapStatusLabel = lv_label_create(screen);
+    lv_label_set_text(mapStatusLabel, "GPS SEARCHING  |  NORTH UP");
+    lv_obj_set_width(mapStatusLabel, 236);
+    lv_obj_set_style_text_color(mapStatusLabel, lv_color_hex(0xF5FF3B), 0);
+    lv_obj_set_style_text_font(mapStatusLabel, &lv_font_montserrat_12, 0);
+    lv_obj_set_pos(mapStatusLabel, 36, 380);
+
+    mapCoordLabel = lv_label_create(screen);
+    lv_label_set_text(mapCoordLabel, "LAT --.------\nLON --.------");
+    lv_obj_set_width(mapCoordLabel, 238);
+    lv_obj_set_style_text_color(mapCoordLabel, lv_color_hex(0xDDE7F2), 0);
+    lv_obj_set_style_text_font(mapCoordLabel, &lv_font_montserrat_12, 0);
+    lv_obj_set_pos(mapCoordLabel, 36, 404);
+
+    mapSdLabel = lv_label_create(screen);
+    const bool tilesReady = mapSdFolderReady();
+    lv_label_set_text(
+        mapSdLabel,
+        tilesReady
+            ? "SD MAPS: FOUND"
+            : "SD MAPS: /M33KX/MAPS MISSING"
+    );
+    lv_obj_set_width(mapSdLabel, 238);
+    lv_obj_set_style_text_color(
+        mapSdLabel,
+        lv_color_hex(tilesReady ? 0x7CFF45 : 0xFFB84D),
+        0
+    );
+    lv_obj_set_style_text_font(mapSdLabel, &lv_font_montserrat_12, 0);
+    lv_obj_set_pos(mapSdLabel, 36, 454);
+
+    mapZoomLabel = lv_label_create(screen);
+    lv_label_set_text_fmt(
+        mapZoomLabel,
+        "ZOOM %u",
+        (unsigned)mapZoomLevel
+    );
+    lv_obj_set_width(mapZoomLabel, 100);
+    lv_obj_set_style_text_align(mapZoomLabel, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_color(mapZoomLabel, lv_color_hex(0xFF52C8), 0);
+    lv_obj_set_style_text_font(mapZoomLabel, &lv_font_montserrat_12, 0);
+    lv_obj_set_pos(mapZoomLabel, 280, 382);
+
+    lv_obj_t *minus = lv_button_create(screen);
+    lv_obj_set_size(minus, 46, 46);
+    lv_obj_set_pos(minus, 276, 414);
+    lv_obj_set_style_radius(minus, 14, 0);
+    lv_obj_set_style_bg_color(minus, lv_color_hex(0x101A2A), 0);
+    lv_obj_set_style_border_width(minus, 1, 0);
+    lv_obj_set_style_border_color(minus, lv_color_hex(0x55EEFF), 0);
+    lv_obj_add_event_cb(
+        minus,
+        mapZoomEvent,
+        LV_EVENT_CLICKED,
+        reinterpret_cast<void *>(static_cast<intptr_t>(-1))
+    );
+    lv_obj_t *minusText = lv_label_create(minus);
+    lv_label_set_text(minusText, "-");
+    lv_obj_set_style_text_font(minusText, &lv_font_montserrat_22, 0);
+    lv_obj_set_style_text_color(minusText, lv_color_hex(0x55EEFF), 0);
+    lv_obj_center(minusText);
+
+    lv_obj_t *plus = lv_button_create(screen);
+    lv_obj_set_size(plus, 46, 46);
+    lv_obj_set_pos(plus, 330, 414);
+    lv_obj_set_style_radius(plus, 14, 0);
+    lv_obj_set_style_bg_color(plus, lv_color_hex(0x101A2A), 0);
+    lv_obj_set_style_border_width(plus, 1, 0);
+    lv_obj_set_style_border_color(plus, lv_color_hex(0xFF52C8), 0);
+    lv_obj_add_event_cb(
+        plus,
+        mapZoomEvent,
+        LV_EVENT_CLICKED,
+        reinterpret_cast<void *>(static_cast<intptr_t>(1))
+    );
+    lv_obj_t *plusText = lv_label_create(plus);
+    lv_label_set_text(plusText, "+");
+    lv_obj_set_style_text_font(plusText, &lv_font_montserrat_22, 0);
+    lv_obj_set_style_text_color(plusText, lv_color_hex(0xFF52C8), 0);
+    lv_obj_center(plusText);
+
+    refreshMapShellZoom();
+
+    mapTimer = lv_timer_create(mapTimerCb, 500, nullptr);
+    lv_timer_ready(mapTimer);
+    noteActivity();
+    Serial.println("[M33K] Map shell opened");
+}
+
+
 void showGpsPage()
 {
     clearScreen();
@@ -14003,6 +17904,21 @@ void showGpsPage()
         0
     );
     lv_obj_set_pos(gpsDataLabel, 12, 44);
+
+    lv_obj_t *mapBtn = lv_button_create(screen);
+    lv_obj_set_size(mapBtn, 64, 42);
+    lv_obj_set_pos(mapBtn, 316, 17);
+    lv_obj_set_style_radius(mapBtn, 13, 0);
+    lv_obj_set_style_bg_color(mapBtn, lv_color_hex(0x081826), 0);
+    lv_obj_set_style_border_width(mapBtn, 1, 0);
+    lv_obj_set_style_border_color(mapBtn, lv_color_hex(0x55EEFF), 0);
+    lv_obj_add_event_cb(mapBtn, mapOpenEvent, LV_EVENT_CLICKED, nullptr);
+
+    lv_obj_t *mapBtnText = lv_label_create(mapBtn);
+    lv_label_set_text(mapBtnText, "MAP");
+    lv_obj_set_style_text_color(mapBtnText, lv_color_hex(0x55EEFF), 0);
+    lv_obj_set_style_text_font(mapBtnText, &lv_font_montserrat_14, 0);
+    lv_obj_center(mapBtnText);
 
     gpsTimer = lv_timer_create(gpsTimerCb, 500, nullptr);
     lv_timer_ready(gpsTimer);
@@ -14466,6 +18382,16 @@ void setup()
 
     Serial.println("\n[M33K X] v0.6.0i-beta dev (no phone companion) starting...");
 
+    // M33K X: T-Watch Ultra display must use DMA-capable
+    // LVGL buffers. Without this, LVGL buffers live in PSRAM and
+    // ESP-IDF has to allocate a temporary DMA TX buffer on every
+    // display flush, which fails under Wi-Fi/BLE radio load.
+    instance.setDisplayParams(true, false);
+
+    Serial.println(
+        "[M33K DISPLAY] QSPI DMA enabled before board init"
+    );
+
     instance.begin(NO_HW_LORA);
     instance.setRotation(M33K_ROTATION);
 
@@ -14530,9 +18456,181 @@ void setup()
     showHome();
 }
 
+bool wardriveExitRadioIdle()
+{
+    if (WiFi.scanComplete() == WIFI_SCAN_RUNNING) {
+        return false;
+    }
+
+    if (bleScannerInitialized) {
+        NimBLEScan *scan = NimBLEDevice::getScan();
+        if (scan && scan->isScanning()) {
+            return false;
+        }
+    }
+
+    if (c5DiscoveryInFlight) {
+        return false;
+    }
+
+    return true;
+}
+
+void finalizeWardriveExitToRecon()
+{
+    const int16_t wifiState = WiFi.scanComplete();
+    if (wifiState != WIFI_SCAN_RUNNING) {
+        WiFi.scanDelete();
+    }
+
+    if (bleScannerInitialized) {
+        NimBLEScan *scan = NimBLEDevice::getScan();
+        if (scan && !scan->isScanning()) {
+            scan->clearResults();
+            scan->setMaxResults(MAX_BLE_DETAILS);
+        }
+    }
+
+    bleScanFinished = false;
+
+    // Radios are idle now, so finish cleanup before deleting the
+    // Wardrive screen and constructing the Recon dashboard.
+    stopWardriveTool();
+
+    wardriveExitToReconPending = false;
+    showReconPage();
+}
+
 void loop()
 {
     instance.loop();
+
+    // Complete Wardrive -> Recon only after both the LVGL callback and all
+    // asynchronous Wardrive radio work have gone idle.
+    if (wardriveExitToReconPending && wardriveExitRadioIdle()) {
+        finalizeWardriveExitToRecon();
+    }
+
+    // --------------------------------------------------------
+    // Finish cleanup from a stopped Wardrive session.
+    //
+    // Do this from loop(), not from the button callback, so
+    // NimBLE/C5 callbacks can finish safely first.
+    // --------------------------------------------------------
+    if (wardriveStopCleanupPending) {
+
+        // Continue requesting disconnect while the old transport
+        // is still alive.
+        if (c5Client && c5Client->isConnected()) {
+            c5Client->disconnect();
+        }
+
+        const bool c5StillBusy =
+            c5DiscoveryInFlight ||
+            c5ScanInFlight ||
+            c5TransportConnected();
+
+        if (!c5StillBusy) {
+
+            if (c5Client) {
+                NimBLEDevice::deleteClient(c5Client);
+                c5Client = nullptr;
+
+                Serial.println(
+                    "[M33K WARD] stopped-session C5 client released"
+                );
+            }
+
+            c5Authenticated = false;
+
+            wardriveC5CycleActive = false;
+            wardriveC5CycleStartedMs = 0;
+            wardriveC5RequestGeneration =
+                c5ScanGeneration;
+
+            // Do not merge previous-session C5 data.
+            c5WifiDetailCount = 0;
+            c5WifiPendingDetailCount = 0;
+
+            // Release completed watch-side BLE results too.
+            if (bleScannerInitialized) {
+                NimBLEScan *scan =
+                    NimBLEDevice::getScan();
+
+                if (scan && !scan->isScanning()) {
+                    scan->clearResults();
+                    scan->setMaxResults(
+                        MAX_BLE_DETAILS
+                    );
+                }
+            }
+
+            bleScanFinished = false;
+            bleScanEndReason = 0;
+
+            // Release completed local Wi-Fi scan storage.
+            const int16_t wifiState =
+                WiFi.scanComplete();
+
+            if (wifiState != WIFI_SCAN_RUNNING) {
+                WiFi.scanDelete();
+            }
+
+            wardriveMemoryPaused = false;
+            wardriveStopCleanupPending = false;
+
+            Serial.printf(
+                "[M33K WARD] stop cleanup complete | heap=%u dma=%u\n",
+                (unsigned)ESP.getFreeHeap(),
+                (unsigned)heap_caps_get_free_size(
+                    MALLOC_CAP_DMA |
+                    MALLOC_CAP_INTERNAL
+                )
+            );
+        }
+    }
+
+    if (wardriveOpenFromReconPending &&
+        !wardriveStopCleanupPending) {
+
+        wardriveOpenFromReconPending = false;
+        showWardrivePage();
+    }
+
+    if (reconExitHomePending) {
+        reconExitHomePending = false;
+        showHome();
+    }
+
+    if (mapOpenPending) {
+        mapOpenPending = false;
+        showMapPage();
+    }
+
+    if (mapBackToGpsPending) {
+        mapBackToGpsPending = false;
+        showGpsPage();
+    }
+
+    if (mapTileReloadPending && currentPage == Page::Map) {
+        loadRequestedMapTile();
+    }
+
+    if (wifiPendingNav != WifiPendingNav::None) {
+        const WifiPendingNav nav = wifiPendingNav;
+        wifiPendingNav = WifiPendingNav::None;
+
+        if (nav == WifiPendingNav::OpenGraph) {
+            wifiSubpageTransition = true;
+            showWifiGraphPage();
+        } else if (nav == WifiPendingNav::BackToScanner) {
+            wifiSubpageTransition = true;
+            showWifiPage();
+        } else if (nav == WifiPendingNav::ExitHome) {
+            wifiSubpageTransition = false;
+            showHome();
+        }
+    }
 
     // Apply NimBLE callback results on the main Arduino task before any LVGL
     // Wi-Fi timer can start/restart a scan.
@@ -14651,6 +18749,86 @@ void loop()
             finishWardriveBleScan();
         } else if (bleScannerInitialized) {
             NimBLEDevice::getScan()->clearResults();
+        }
+    }
+
+    // --------------------------------------------------------
+    // Wardrive background engine fallback.
+    //
+    // Keep the Wardrive scheduler advancing directly from
+    // loop() while the screen/backlight is dark.
+    // --------------------------------------------------------
+    if (screenSleeping &&
+        currentPage == Page::Wardrive &&
+        wardrivePageActive &&
+        wardriveRunning) {
+
+        static uint32_t wardriveBackgroundServiceMs = 0;
+        const uint32_t now = millis();
+
+        if (now - wardriveBackgroundServiceMs >= 150UL) {
+            wardriveBackgroundServiceMs = now;
+            wardriveTimerCb(nullptr);
+        }
+    }
+
+    // --------------------------------------------------------
+    // Temporary Wardrive lifecycle diagnostics.
+    // No state is modified here.
+    // --------------------------------------------------------
+    if (currentPage == Page::Wardrive ||
+        wardriveRunning ||
+        wardriveExitToReconPending) {
+
+        static uint32_t wardriveDiagPrintMs = 0;
+        const uint32_t diagNow = millis();
+
+        if (diagNow - wardriveDiagPrintMs >= 5000UL) {
+            wardriveDiagPrintMs = diagNow;
+
+            const int16_t wifiScanState =
+                WiFi.scanComplete();
+
+            bool bleScanningNow = false;
+
+            if (bleScannerInitialized) {
+                NimBLEScan *scan =
+                    NimBLEDevice::getScan();
+
+                if (scan) {
+                    bleScanningNow =
+                        scan->isScanning();
+                }
+            }
+
+            Serial.printf(
+                "[M33K WARD DIAG] "
+                "page=%d run=%d active=%d sleep=%d "
+                "phase=%d wifiState=%d wifi=%lu ble=%lu "
+                "bleScan=%d "
+                "sd=%d sdReady=%d rows=%lu "
+                "c5Linked=%d c5Transport=%d "
+                "c5Discover=%d c5Scan=%d c5Cycle=%d "
+                "exit=%d\n",
+                static_cast<int>(currentPage),
+                wardriveRunning ? 1 : 0,
+                wardrivePageActive ? 1 : 0,
+                screenSleeping ? 1 : 0,
+                static_cast<int>(wardrivePhase),
+                static_cast<int>(wifiScanState),
+                (unsigned long)wardriveTotalWifiCount,
+                (unsigned long)wardriveTotalBleCount,
+                bleScanningNow ? 1 : 0,
+                wardriveSdLogging ? 1 : 0,
+                m33kSdReady ? 1 : 0,
+                (unsigned long)wardriveSdRowsWritten,
+                c5IsLinked() ? 1 : 0,
+                c5TransportConnected() ? 1 : 0,
+                c5DiscoveryInFlight ? 1 : 0,
+                c5ScanInFlight ? 1 : 0,
+                wardriveC5CycleActive ? 1 : 0,
+                wardriveExitToReconPending ? 1 : 0
+            );
         }
     }
 
