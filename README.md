@@ -14,16 +14,26 @@ This repository contains the public source snapshot corresponding to the M33K X 
 
 Both projects are built with PlatformIO.
 
+## Features
+
+- **Watch faces** — multiple animated faces, including a live **weather face** (pulls current conditions over Wi-Fi and animates to match: sun, clouds, rain, lightning, snow, fog, with day/night) and a neon **radar face**.
+- **Wi-Fi / BLE recon** — scanning and logging, plus a **Signal Hunter** proximity mode.
+- **Wardrive logging** — Wi-Fi / BLE session logging (C5-assisted 5 GHz discovery).
+- **LoRa Mesh Monitor** — receive-only MeshCore monitor that decodes the public channel and shows live packets (signal, spreading factor, hex). It never transmits.
+- **M33K Arcade** — built-in mini-games: an endless **Runner** and a top-down **Wardrive**, with arcade sound effects.
+- **GPS**.
+- **NFC** — experimental and in active development; disabled in the public build.
+
 ## Public beta
 
 Current public firmware:
 
-- M33K X Watch — v0.6.0h public beta
+- M33K X Watch — v0.6.1 public beta
 - M33K X C5 — v0.1.3 public beta
 
 The C5 companion extends the Watch with 5 GHz Wi-Fi scanning and uses per-device Watch-to-C5 enrollment and authenticated reconnect.
 
-NFC and Radio / LoRa remain experimental and in active development.
+NFC remains experimental and is disabled in the public build.
 
 ## Web Flasher
 

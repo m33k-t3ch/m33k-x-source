@@ -13,6 +13,7 @@ M33K X depends on third-party libraries and vendor components. Those components 
 | NimBLE-Arduino | Apache License 2.0 |
 | LilyGoLib | MIT |
 | SensorLib | MIT |
+| Mbed TLS (via ESP-IDF / Arduino-ESP32 core) | Apache License 2.0 |
 
 Vendored third-party source must retain its original license and copyright notices. The copies of LilyGoLib and SensorLib in this repository include their own license files.
 

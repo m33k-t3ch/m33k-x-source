@@ -7,6 +7,8 @@
 SET_LOOP_TASK_STACK_SIZE(16 * 1024);
 
 #include <WiFi.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
 #include <esp_wifi.h>
 #include <esp_system.h>
 #include <esp_heap_caps.h>
@@ -19,6 +21,8 @@ SET_LOOP_TASK_STACK_SIZE(16 * 1024);
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
 #include "mbedtls/md.h"
+#include "mbedtls/aes.h"
+#include "mbedtls/sha256.h"
 #include <LilyGoLib.h>
 #include <LV_Helper.h>
 #include <lvgl.h>
@@ -27,7 +31,12 @@ SET_LOOP_TASK_STACK_SIZE(16 * 1024);
 #include "bunny_skull_small.h"
 #include "bunny_skull_graph.h"
 #include "wifi_bunny_bg.h"
-#include "ble_bunny_bg.h"
+#include "m33k_ble_anim.h"
+#include "m33k_faces.h"
+#include "m33k_bubbles.h"
+#include "m33k_wx.h"
+#include "m33k_radarface.h"
+#include "m33k_game.h"
 #include "hunter_choose_bg.h"
 #include "wardrive_banner.h"
 #include "recon_dashboard_art.h"
@@ -50,7 +59,14 @@ uint8_t displayBrightnessRaw()
     return static_cast<uint8_t>((pct * 255u) / 100u);
 }
 
-constexpr uint32_t SCREEN_TIMEOUT_MS = 30000;
+constexpr uint32_t SCREEN_TIMEOUT_MS = 25000;
+
+// After the screen has been idle this long, shed the GNSS rail to save
+// battery during deep idle (pocket/overnight). GPS stays powered during
+// normal use and brief screen-sleeps so satellite lock stays warm; it is
+// only cut once the watch has clearly been set down, and is restored the
+// instant the screen wakes. See sleepScreen()/wakeScreen() and loop().
+constexpr uint32_t GPS_DEEP_IDLE_MS = 180000;  // 3 minutes
 
 constexpr int16_t SCREEN_W = 410;
 constexpr int16_t SCREEN_H = 502;
@@ -72,7 +88,8 @@ enum class Page : uint8_t {
     NFC,
     Logs,
     Settings,
-    Stopwatch
+    Stopwatch,
+    Game
 };
 
 struct DockItem {
@@ -250,6 +267,7 @@ constexpr DockItem dock[] = {
     {"GPS",      LV_SYMBOL_GPS,       0xF5FF3B, Page::GPS},
     {"NFC",      "N",                 0xB37BFF, Page::NFC},
     {"Logs",     LV_SYMBOL_FILE,      0x6AFF78, Page::Logs},
+    {"Game",     "G",                 0xFF2A2A, Page::Game},
     {"Settings", LV_SYMBOL_SETTINGS,  0xF4F6FF, Page::Settings},
 };
 
@@ -262,6 +280,12 @@ lv_obj_t *screen = nullptr;
 lv_timer_t *matrixTimer = nullptr;
 lv_timer_t *homeLiveTimer = nullptr;
 lv_timer_t *wifiTimer = nullptr;
+// Animated m33k running across the Wi-Fi scan page (replaces the static bunny).
+lv_obj_t *wifiMascot = nullptr;
+lv_timer_t *wifiMascotTimer = nullptr;
+int wifiMascotX = 20, wifiMascotFrame = 0, wifiMascotDir = 1;
+uint32_t wifiMascotAnimMs = 0;
+void wifiMascotCb(lv_timer_t *timer);
 lv_timer_t *gpsTimer = nullptr;
 lv_timer_t *mapTimer = nullptr;
 lv_timer_t *reconTimer = nullptr;
@@ -491,6 +515,15 @@ bool m33kRadioListening = false;
 bool m33kRadioAutoScan = false;
 uint8_t m33kRadioSfIndex = 2;
 uint8_t m33kRadioBwIndex = 0;
+// MeshCore "Listen" preset: tunes the receiver to the MeshCore US/Canada LoRa
+// radio parameters so it actually hears MeshCore traffic. Still receive-only;
+// this does NOT decode/decrypt or join the mesh (that is a separate project).
+bool m33kRadioMeshCore = false;
+constexpr float   M33K_MESHCORE_FREQ_MHZ = 910.525f;  // US/Canada preset
+constexpr float   M33K_MESHCORE_BW_KHZ   = 62.5f;
+constexpr uint8_t M33K_MESHCORE_SF       = 7;
+constexpr uint8_t M33K_MESHCORE_CR       = 5;          // 4/5
+constexpr uint8_t M33K_MESHCORE_SYNC     = 0x12;       // RadioLib private default
 uint32_t m33kRadioNextProfileMs = 0;
 uint32_t m33kRadioPacketCount = 0;
 uint32_t m33kRadioLastPacketMs = 0;
@@ -516,6 +549,7 @@ lv_obj_t *radioListenLabel = nullptr;
 lv_obj_t *radioSfButtonLabel = nullptr;
 lv_obj_t *radioBwButtonLabel = nullptr;
 lv_obj_t *radioAutoButtonLabel = nullptr;
+lv_obj_t *radioMeshButtonLabel = nullptr;
 
 // Recon Radar
 constexpr uint8_t MAX_RADAR_BLIPS = 12;
@@ -610,6 +644,9 @@ bool hunterAudioConfigured = false;
 // GPS / GNSS page
 TinyGPSPlus gpsParser;
 bool gpsToolActive = true;
+// True while the GNSS rail has been powered down for deep-idle battery
+// saving, so wakeScreen() knows to turn it back on.
+bool gpsDeepIdleOff = false;
 bool gpsSessionLocationSeen = false;
 uint32_t gpsSessionBytes = 0;
 uint32_t gpsPageOpenedMs = 0;
@@ -855,6 +892,17 @@ lv_obj_t *bleDetailOverlay = nullptr;
 lv_obj_t *bleDetailTitle = nullptr;
 lv_obj_t *bleDetailBody = nullptr;
 
+// Animated m33k t3ch character on the BLE page (behind the device list).
+lv_obj_t *bleCat = nullptr;
+lv_obj_t *blePingRing = nullptr;
+lv_timer_t *bleAnimTimer = nullptr;
+int bleAnimStep = 0;
+uint32_t bleAnimStepStart = 0;
+int bleWalkSub = 0;
+uint32_t bleWalkSubStart = 0;
+int16_t blePingCx = 205;
+int16_t blePingCy = 300;
+
 volatile bool bleScanFinished = false;
 volatile int bleScanEndReason = 0;
 bool bleScannerInitialized = false;
@@ -894,6 +942,16 @@ lv_obj_t *manualMinuteSpin = nullptr;
 uint32_t lastActivityMs = 0;
 uint32_t ignoreClicksUntil = 0;
 bool screenSleeping = false;
+
+// Screen lock. When locked, all dock/tool taps are suppressed (via
+// clickAllowed) so a stray touch can't launch a tool. A long press toggles
+// the lock; the screen also auto-locks whenever it sleeps.
+bool screenLocked = false;
+constexpr uint32_t LOCK_LONGPRESS_MS = 650;
+uint32_t touchDownMs = 0;
+bool touchWasDown = false;
+bool lockPressHandled = false;
+lv_obj_t *lockIndicator = nullptr;
 uint32_t lastWifiUiUpdateMs = 0;
 
 // Bottom custom side button on the T-Watch Ultra is GPIO0.
@@ -966,6 +1024,8 @@ constexpr uint32_t WARD_BLE_INTERVAL_MS = 18000UL;
 
 void stopWardriveTool();
 void stopRadioTool();
+void showGamePage();
+void stopGameTool();
 void stopNfcTool();
 void stopReconPulseTool();
 void resetWifiGraphDrops();
@@ -1002,6 +1062,193 @@ const char *WEEKDAYS[] = {
     "THURSDAY", "FRIDAY", "SATURDAY"
 };
 
+// ----------------------------------------------------------------------------
+// Home watch faces: 0 = Original (unchanged), 1 = Terminal, 2 = M33K Crew,
+// 3 = Video. Swipe left/right on Home to cycle; the choice persists in NVS.
+// ----------------------------------------------------------------------------
+uint8_t homeFaceIndex = 0;
+constexpr uint8_t HOME_FACE_COUNT = 7;
+lv_timer_t *faceAnimTimer = nullptr;
+lv_obj_t *faceClockHour = nullptr, *faceClockColon = nullptr,
+         *faceClockMin = nullptr, *faceClockDate = nullptr;
+lv_obj_t *termTime = nullptr, *termDate = nullptr, *termBatt = nullptr,
+         *termCursor = nullptr;
+lv_obj_t *crewMain = nullptr, *crewCatBody = nullptr, *crewCatTail = nullptr,
+         *crewMonBody = nullptr, *crewMonTail = nullptr;
+lv_obj_t *videoImg = nullptr;
+int videoFrameIdx = 0;
+int crewCatBaseX = 0, crewCatBaseY = 0, crewMonBaseX = 0, crewMonBaseY = 0;
+uint32_t videoFrameMs = 0, termCursorMs = 0, faceAnimStartMs = 0,
+         lastFaceSwitchMs = 0;
+bool termCursorOn = true;
+
+// Radar face (face 6): a settled m33k t3ch frame with live overlays - the two
+// scope eyes get a sweep hand plus spinning rings, a cycling readout animates
+// between the eyes, and the time shows as sideways neon-green 7-segment digits.
+lv_obj_t *radarFaceImg = nullptr, *radarEyeL = nullptr, *radarEyeR = nullptr;
+lv_obj_t *radarEyeLGlow = nullptr, *radarEyeRGlow = nullptr;   // soft pink halo under each sweep
+lv_obj_t *radarRing[4] = {};           // spinning arcs: L-outer,L-inner,R-outer,R-inner
+lv_obj_t *radarRingGlow[4] = {};       // soft wide halo under each ring
+int       radarRingAng[4] = {};
+lv_obj_t *radarCenterTxt = nullptr;    // cycling HUD readout between the eyes
+lv_obj_t *radarVTime = nullptr, *radarVMeta = nullptr;
+lv_obj_t *radarSeg[4][7] = {};         // 7-seg digits: H-tens,H-ones,M-tens,M-ones
+lv_obj_t *radarMetaDay = nullptr, *radarMetaDate = nullptr;
+uint32_t radarClockMs = 0, radarRingMs = 0, radarTxtMs = 0;
+int radarSweepAng = 0;                 // 0.1-degree units for the eye sweeps
+static lv_point_precise_t radarEyeLPts[2];
+static lv_point_precise_t radarEyeRPts[2];
+// Neon green used across the radar face clock/date.
+constexpr uint32_t RADAR_NEON = 0x39FF14;
+// Eye centers (measured on the settled frame) and sweep radius.
+constexpr int RADAR_LX = 63, RADAR_LY = 250, RADAR_RX = 342, RADAR_RY = 250, RADAR_ER = 72;
+
+// ---- M33K Runner game (Page::Game) ----
+lv_timer_t *gameTimer = nullptr;
+enum class GameState : uint8_t { Pick, Play, Dead };
+GameState gameState = GameState::Pick;
+lv_obj_t *gameBg = nullptr, *gameGroundLine = nullptr, *gamePlayer = nullptr;
+lv_obj_t *gameScoreLbl = nullptr, *gameBestLbl = nullptr;
+lv_obj_t *gamePickPanel = nullptr, *gamePickTitle = nullptr, *gamePickHint = nullptr, *gameOverLbl = nullptr;
+lv_obj_t *gamePickBtn[4] = {};
+constexpr int GAME_OBS = 10;
+struct GameObs { lv_obj_t *img; bool active; bool air; float x, w, h; int bob, oy; };
+GameObs gameObs[GAME_OBS] = {};
+int   gameSel = 0, gameBest = 0, gameShake = 0, gameFrame = 0;
+float gamePy = 0, gameVy = 0, gameSpd = 280, gameDist = 0, gameSpawnIn = 0.9f, gamePw = 40, gamePh = 58;
+bool  gameOnGround = true, gameLastAir = false;
+uint32_t gameAnimMs = 0;
+constexpr int   GAME_GROUND_Y = 430;
+constexpr float GAME_GRAV = 2600.0f, GAME_JUMP = 860.0f, GAME_FLAP = 480.0f;
+// Parallax skyline + stars to fill the sky above the runner.
+constexpr int GAME_BLD = 7, GAME_STAR = 9;
+lv_obj_t *gameBld[GAME_BLD] = {}, *gameStar[GAME_STAR] = {};
+float gameBldX[GAME_BLD] = {};
+// Wi-Fi / BLE signal bursts popping in the sky.
+constexpr int GAME_POP = 3;
+lv_obj_t *gamePop[GAME_POP] = {};
+float gamePopT[GAME_POP] = { -1.0f, -1.0f, -1.0f };
+int gamePopX[GAME_POP] = {}, gamePopY[GAME_POP] = {};
+uint32_t gamePopNextMs = 0;
+// Blasts the runner fires while airborne, to pop the flying bubbles.
+constexpr int GAME_BLAST = 4;
+lv_obj_t *gameBlast[GAME_BLAST] = {};
+float gameBlastX[GAME_BLAST] = {}, gameBlastY[GAME_BLAST] = {};
+bool  gameBlastActive[GAME_BLAST] = {};
+// Explosions when a bubble is popped (red / white / black flash).
+constexpr int GAME_EXPL = 4;
+lv_obj_t *gameExpl[GAME_EXPL] = {};
+float gameExplT[GAME_EXPL] = { -1.0f, -1.0f, -1.0f, -1.0f };
+int gameExplX[GAME_EXPL] = {}, gameExplY[GAME_EXPL] = {};
+
+// ---- Wardrive mini-game (second mode on the Game page) ----
+// Top-down: drive a character car around collecting Wi-Fi / BLE signals while
+// dodging roaming "malware". gameMode: 0 = M33K Runner, 1 = Wardrive.
+int gameMode = 0;
+lv_obj_t *gameModeBtn[2] = {};
+lv_obj_t *driveCar = nullptr, *driveBg = nullptr, *driveHead = nullptr;
+float carX = 205, carY = 250, carHeading = 0, carSpeed = 150;
+float carTargetX = 205, carTargetY = 120;
+bool  carSteer = false;
+constexpr int DRV_PICK = 6;                 // signal pickups on the map
+lv_obj_t *drvPick[DRV_PICK] = {};
+float drvPickX[DRV_PICK] = {}, drvPickY[DRV_PICK] = {};
+bool  drvPickBle[DRV_PICK] = {};
+constexpr int DRV_ENE = 6;                  // malware enemies
+lv_obj_t *drvEne[DRV_ENE] = {};
+float drvEneX[DRV_ENE] = {}, drvEneY[DRV_ENE] = {}, drvEneVx[DRV_ENE] = {}, drvEneVy[DRV_ENE] = {};
+bool  drvEneActive[DRV_ENE] = {};
+int   driveScore = 0, driveBest = 0, driveActiveEne = 2, driveSignals = 0;
+float driveTime = 0;
+uint32_t drvPulseMs = 0;
+// Per-character car trim colors (body stays dark).
+constexpr uint32_t DRV_TRIM[4] = { 0x3AEFFF, 0x39FF14, 0xFFB83A, 0xFF4AD5 };
+void driveStart(int sel);
+void driveDie();
+
+// Matrix-rain tuning the faces override before createMatrixBackground():
+// per-frame horizontal drift (diagonal rain) and the two glyph colors.
+int matrixDriftX = 0;
+uint32_t matrixColA = 0x3AEFFF, matrixColB = 0xFF4AD5;
+// Per-face overrides (0 = use defaults): recolor the matrix bunny skulls, and
+// tint the dock icons. Faces set these before createMatrixBackground/createDock.
+uint32_t matrixSkullRecolor   = 0;
+uint32_t dockIconColorOverride = 0;
+
+// Bubbles face: character portraits float UP in big neon bubbles, while a
+// field of small faint bubbles drifts DOWN behind them.
+struct BubbleEntity {
+    lv_obj_t *obj;
+    lv_obj_t *glowL, *glowR;   // pulsing eye-glow overlays (null if none)
+    float x, y;        // top-left position (float for smooth motion)
+    float speed;       // pixels per tick (up for chars, down for background)
+    float phase;       // horizontal-sway phase
+    float swayAmp;     // horizontal-sway amplitude
+    int size;
+};
+constexpr int BUBBLE_COUNT    = 5;    // character bubbles (rise), all unique
+constexpr int BG_BUBBLE_COUNT = 10;   // small background bubbles (fall)
+BubbleEntity gBubbles[BUBBLE_COUNT] = {};
+BubbleEntity gBgBubbles[BG_BUBBLE_COUNT] = {};
+void bubbleRespawn(int i, bool initial);
+// Swipe-to-switch tracking (manual, more reliable than LVGL gestures).
+int16_t swipeStartX = 0, swipeStartY = 0;
+int16_t swipeLastX = 0, swipeLastY = 0;
+uint32_t swipeStartMs = 0;
+uint32_t swipeLostMs = 0;   // when touch first went absent mid-drag (0 = present)
+bool swipeTracking = false;
+
+// ----------------------------------------------------------------------------
+// Weather face (home face). Pulls live weather from Open-Meteo over the saved
+// Wi-Fi link. Location comes from GPS when there is a fix, otherwise from a
+// runtime IP-geolocation lookup -- NO coordinates or personal data live in this
+// source, so the public firmware ships clean.
+// ----------------------------------------------------------------------------
+enum class WeatherState : uint8_t { Idle, Updating, Ready, NoWifi, Error };
+WeatherState weatherState = WeatherState::Idle;
+float    weatherTempF = 0, weatherHiF = 0, weatherLoF = 0;
+int      weatherCode = -1;
+bool     weatherIsDay = true;
+String   weatherPlace = "";
+String   weatherUpdatedStr = "";   // "MM/DD HH:MM" of last successful fetch
+bool     weatherHaveData = false;  // true once we have any reading (RAM or NVS)
+uint32_t weatherLastFetchMs = 0;
+bool     weatherFetchPending = false;
+lv_obj_t *weatherTempLabel = nullptr, *weatherCondLabel = nullptr,
+         *weatherHiLoLabel = nullptr, *weatherPlaceLabel = nullptr,
+         *weatherStatusLabel = nullptr, *weatherIcon = nullptr;
+constexpr uint32_t WEATHER_REFRESH_MS = 15UL * 60UL * 1000UL;  // 15 minutes
+// Animated weather backdrop: cycles storm/lightning -> sunshine and back.
+lv_obj_t *wxBg = nullptr, *wxFlash = nullptr, *wxSun = nullptr, *wxBolt = nullptr;
+lv_obj_t *wxMtn = nullptr, *wxCity = nullptr;   // mountains (sun) / skyline (storm)
+lv_obj_t *wxCloud1 = nullptr, *wxCloud2 = nullptr, *wxBird = nullptr;
+float wxCloud1X = 0, wxCloud2X = 0, wxBirdX = 0;
+int wxBirdY = 128;
+uint32_t wxBirdFlapMs = 0;
+bool wxBirdWingsUp = false;
+lv_obj_t *weekCells[7] = {};                    // day-of-week strip
+lv_obj_t *weekDateLabel = nullptr;
+uint32_t wxNextFlashMs = 0, wxFlashUntil = 0;
+// Wind (mph) from the fetch; speeds up clouds/rain and tilts rain when gusty.
+float    weatherWindMph = 0;
+// Condition-driven backdrop extras. The scene is chosen from weather_code +
+// day/night each tick, and these elements fade in only for their condition.
+constexpr int WX_RAIN_N = 14, WX_SNOW_N = 14, WX_STAR_N = 10;
+lv_obj_t *wxMoon = nullptr, *wxFog1 = nullptr, *wxFog2 = nullptr;
+lv_obj_t *wxStars[WX_STAR_N] = {};
+lv_obj_t *wxRain[WX_RAIN_N]  = {};
+lv_obj_t *wxSnow[WX_SNOW_N]  = {};
+float wxRainX[WX_RAIN_N] = {}, wxRainY[WX_RAIN_N] = {}, wxRainSpd[WX_RAIN_N] = {};
+float wxSnowX[WX_SNOW_N] = {}, wxSnowY[WX_SNOW_N] = {}, wxSnowSpd[WX_SNOW_N] = {}, wxSnowPh[WX_SNOW_N] = {};
+float wxFog1X = 0, wxFog2X = 0;
+
+void updateFaceClock();  // defined with the face builders below
+
+void saveHomeFace()
+{
+    prefs.putUChar("face", homeFaceIndex);
+}
+
 void loadPersistentSettings()
 {
     timezoneIndex = prefs.getUChar("tz", TIMEZONE_UNSET);
@@ -1019,6 +1266,9 @@ void loadPersistentSettings()
 
     savedWifiSsid = prefs.getString("ssid", "");
     savedWifiPassword = prefs.getString("pass", "");
+
+    homeFaceIndex = prefs.getUChar("face", 0);
+    if (homeFaceIndex >= HOME_FACE_COUNT) homeFaceIndex = 0;
 }
 
 void saveTimezone()
@@ -1075,6 +1325,40 @@ void noteActivity()
 bool clickAllowed()
 {
     return !screenSleeping && millis() >= ignoreClicksUntil;
+}
+
+// Show/hide a small "LOCKED" badge on the top layer so it floats over any
+// page. Must be called from the LVGL/loop context (it creates LVGL objects).
+void updateLockIndicator()
+{
+    if (screenLocked) {
+        if (!lockIndicator) {
+            lockIndicator = lv_label_create(lv_layer_top());
+            lv_label_set_text(lockIndicator, "LOCKED  -  HOLD TO UNLOCK");
+            lv_obj_set_style_text_color(lockIndicator, lv_color_hex(0xFF4FC3), 0);
+            lv_obj_set_style_bg_color(lockIndicator, lv_color_hex(0x000000), 0);
+            lv_obj_set_style_bg_opa(lockIndicator, LV_OPA_60, 0);
+            lv_obj_set_style_pad_all(lockIndicator, 5, 0);
+            lv_obj_set_style_radius(lockIndicator, 8, 0);
+            lv_obj_add_flag(lockIndicator, LV_OBJ_FLAG_FLOATING);
+            lv_obj_clear_flag(lockIndicator, LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_align(lockIndicator, LV_ALIGN_TOP_MID, 0, 6);
+        }
+        lv_obj_move_foreground(lockIndicator);
+        lv_obj_clear_flag(lockIndicator, LV_OBJ_FLAG_HIDDEN);
+    } else if (lockIndicator) {
+        lv_obj_add_flag(lockIndicator, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+void setScreenLocked(bool locked)
+{
+    screenLocked = locked;
+    // Swallow the release of the gesture that toggled the lock so it does not
+    // also register as a tap once unlocked.
+    ignoreClicksUntil = millis() + 500;
+    updateLockIndicator();
+    Serial.printf("[M33K] Screen %s\n", locked ? "LOCKED" : "unlocked");
 }
 
 void sleepScreen()
@@ -1153,8 +1437,15 @@ void wakeScreen()
     // First touch only wakes the watch instead of also opening a tool.
     ignoreClicksUntil = millis() + 350;
 
-    // GNSS remains powered while the display sleeps, so no receiver restart
-    // is needed on wake. This preserves warm/hot satellite acquisition state.
+    // GNSS stays powered through brief screen-sleeps, so no restart is needed
+    // on a normal wake. Only if deep idle had shed the GNSS rail do we restore
+    // it here; a cold re-acquire after a long idle is an acceptable trade.
+    if (gpsDeepIdleOff) {
+        instance.powerControl(POWER_GPS, true);
+        gpsToolActive = true;
+        gpsDeepIdleOff = false;
+        Serial.println("[M33K POWER] Wake: GNSS rail restored after deep idle");
+    }
 
     if (matrixTimer) lv_timer_resume(matrixTimer);
     if (homeLiveTimer) {
@@ -1407,6 +1698,7 @@ void homeLiveTimerCb(lv_timer_t *timer)
 {
     LV_UNUSED(timer);
     updateHomeLiveData();
+    updateFaceClock();
 }
 
 // -----------------------------------------------------------------------------
@@ -1427,7 +1719,7 @@ void buildMatrixStream(MatrixEntity &ent)
     lv_obj_clear_flag(ent.obj, LV_OBJ_FLAG_SCROLLABLE);
 
     for (uint8_t i = 0; i < ent.lines; ++i) {
-        const uint32_t colorHex = random(0, 2) ? 0x3AEFFF : 0xFF4AD5;
+        const uint32_t colorHex = random(0, 2) ? matrixColA : matrixColB;
         const bool makeZero = random(0, 100) < 56;
 
         lv_obj_t *row = lv_obj_create(ent.obj);
@@ -1462,7 +1754,7 @@ void resetEntity(MatrixEntity &ent, bool fullyRandomY)
 {
     ent.x = random(8, SCREEN_W - 30);
     ent.speed = ent.isSkull ? random(2, 4) : random(3, 7);
-    ent.colorHex = random(0, 2) ? 0x3AEFFF : 0xFF4AD5;
+    ent.colorHex = random(0, 2) ? matrixColA : matrixColB;
     ent.y = fullyRandomY ? random(-360, DOCK_Y - 20) : random(-280, -40);
 
     if (ent.isSkull) {
@@ -1476,6 +1768,12 @@ void resetEntity(MatrixEntity &ent, bool fullyRandomY)
         lv_image_set_src(ent.obj, &bunny_skull_small_img);
         lv_obj_set_pos(ent.obj, ent.x, ent.y);
         lv_obj_set_style_opa(ent.obj, 255, 0);
+        if (matrixSkullRecolor != 0) {
+            lv_obj_set_style_img_recolor(ent.obj, lv_color_hex(matrixSkullRecolor), 0);
+            lv_obj_set_style_img_recolor_opa(ent.obj, 255, 0);
+        } else {
+            lv_obj_set_style_img_recolor_opa(ent.obj, 0, 0);
+        }
     } else {
         ent.lines = random(10, 19);
         buildMatrixStream(ent);
@@ -1497,9 +1795,16 @@ void matrixTimerCb(lv_timer_t *timer)
     for (uint8_t i = 0; i < MATRIX_ENTITY_COUNT; ++i) {
         gMatrix[i].y += gMatrix[i].speed;
 
-        if (gMatrix[i].y > DOCK_Y - 10) {
+        if (gMatrix[i].y > DOCK_Y - 10 ||
+            gMatrix[i].x < -30 || gMatrix[i].x > SCREEN_W + 10) {
             resetEntity(gMatrix[i], false);
         } else {
+            if (matrixDriftX != 0) {
+                gMatrix[i].x += matrixDriftX;
+                lv_obj_set_x(gMatrix[i].obj, gMatrix[i].x);
+                lv_obj_set_x(gMatrix[i].glow,
+                             gMatrix[i].x + (gMatrix[i].isSkull ? 2 : 4));
+            }
             lv_obj_set_y(gMatrix[i].obj, gMatrix[i].y);
             lv_obj_set_y(gMatrix[i].glow,
                          gMatrix[i].isSkull ? gMatrix[i].y + 4 : gMatrix[i].y + 2);
@@ -3993,12 +4298,25 @@ void stopWardriveTool()
     // Preserve/arm deferred cleanup when leaving Wardrive.
     // Back navigation can occur while C5 discovery, authentication,
     // or a 5 GHz scan is still active.
+    //
+    // CRITICAL: stopWardriveTool() runs on EVERY page teardown, not just when
+    // leaving Wardrive. The Wi-Fi scanner and live graph also use the shared
+    // C5 link, so we must NOT arm a C5 teardown merely because C5 is connected
+    // (c5TransportConnected()) or a C5 scan is in flight (c5ScanInFlight) -
+    // those are usually owned by the Wi-Fi tool. Doing so was repeatedly
+    // disconnecting C5 on the graph: it would reconnect, then this cleanup
+    // would tear it right back down, in a loop. The explicit Wardrive STOP
+    // path sets wardriveStopCleanupPending itself, so real Wardrive cleanup is
+    // still honored; here we only arm it when a Wardrive session was actually
+    // running (or a C5 cycle it owns is still active).
+    const bool wasWardriveRunning = wardriveRunning;
     const bool wardriveRadioCleanupNeeded =
         wardriveStopCleanupPending ||
         wardriveC5CycleActive ||
-        c5DiscoveryInFlight ||
-        c5ScanInFlight ||
-        c5TransportConnected();
+        (wasWardriveRunning &&
+         (c5DiscoveryInFlight ||
+          c5ScanInFlight ||
+          c5TransportConnected()));
 
     wardriveRunning = false;
     wardriveStopCleanupPending =
@@ -4865,11 +5183,22 @@ float currentRadioBw()
 void updateRadioProfileLabels()
 {
     if (radioProfileLabel) {
+        if (m33kRadioMeshCore)
+            lv_label_set_text(radioProfileLabel, "SF 7\nBW 62.5\nCR 4/5");
+        else
+            lv_label_set_text_fmt(
+                radioProfileLabel,
+                "SF %u\nBW %.0f\nCR 4/7",
+                (unsigned)currentRadioSf(),
+                currentRadioBw()
+            );
+    }
+
+    if (radioFreqLabel) {
         lv_label_set_text_fmt(
-            radioProfileLabel,
-            "SF %u\nBW %.0f\nCR 4/7",
-            (unsigned)currentRadioSf(),
-            currentRadioBw()
+            radioFreqLabel,
+            "FREQ\n%.3f",
+            m33kRadioMeshCore ? M33K_MESHCORE_FREQ_MHZ : M33K_RADIO_FREQ_MHZ
         );
     }
 
@@ -4877,7 +5206,7 @@ void updateRadioProfileLabels()
         lv_label_set_text_fmt(
             radioSfButtonLabel,
             "SF %u",
-            (unsigned)currentRadioSf()
+            (unsigned)(m33kRadioMeshCore ? M33K_MESHCORE_SF : currentRadioSf())
         );
     }
 
@@ -4885,7 +5214,7 @@ void updateRadioProfileLabels()
         lv_label_set_text_fmt(
             radioBwButtonLabel,
             "BW %.0f",
-            currentRadioBw()
+            (double)(m33kRadioMeshCore ? M33K_MESHCORE_BW_KHZ : currentRadioBw())
         );
     }
 
@@ -4896,10 +5225,18 @@ void updateRadioProfileLabels()
         );
     }
 
+    if (radioMeshButtonLabel) {
+        lv_label_set_text(
+            radioMeshButtonLabel,
+            m33kRadioMeshCore ? "MESH ON" : "MESH OFF"
+        );
+    }
+
     if (radioModeLabel) {
         lv_label_set_text(
             radioModeLabel,
-            m33kRadioAutoScan ? "MODE\nAUTO RX" : "MODE\nRX ONLY"
+            m33kRadioMeshCore ? "MODE\nMESHCORE"
+                              : (m33kRadioAutoScan ? "MODE\nAUTO RX" : "MODE\nRX ONLY")
         );
     }
 }
@@ -4932,12 +5269,21 @@ void updateRadioHistoryUi()
     if (!radioPayloadLabel || !m33kRadioHistoryDirty) return;
 
     if (m33kRadioHistoryCount == 0) {
-        lv_label_set_text(
-            radioPayloadLabel,
-            "No matching packets yet.\n\n"
-            "RX-only. AUTO cycles SF7-SF12 and "
-            "125/250/500 kHz receive profiles."
-        );
+        if (m33kRadioMeshCore) {
+            lv_label_set_text(
+                radioPayloadLabel,
+                "Listening on the MeshCore public channel.\n\n"
+                "Decoded public messages appear here when a MeshCore "
+                "node is in range. Receive-only."
+            );
+        } else {
+            lv_label_set_text(
+                radioPayloadLabel,
+                "No matching packets yet.\n\n"
+                "RX-only. AUTO cycles SF7-SF12 and "
+                "125/250/500 kHz receive profiles."
+            );
+        }
         m33kRadioHistoryDirty = false;
         return;
     }
@@ -5027,18 +5373,30 @@ bool applyRadioProfile(bool restartReceive)
         radio.clearDio1Action();
         radio.standby();
 
-        state = radio.setFrequency(M33K_RADIO_FREQ_MHZ);
+        // MeshCore preset forces the mesh radio parameters; otherwise the
+        // generic sniffer uses the user-selected SF/BW at 915 MHz, CR 4/7.
+        const float   cfgFreq = m33kRadioMeshCore ? M33K_MESHCORE_FREQ_MHZ : M33K_RADIO_FREQ_MHZ;
+        const float   cfgBw   = m33kRadioMeshCore ? M33K_MESHCORE_BW_KHZ   : currentRadioBw();
+        const uint8_t cfgSf   = m33kRadioMeshCore ? M33K_MESHCORE_SF       : currentRadioSf();
+        const uint8_t cfgCr   = m33kRadioMeshCore ? M33K_MESHCORE_CR       : 7;
+
+        state = radio.setFrequency(cfgFreq);
 
         if (state == RADIOLIB_ERR_NONE) {
-            state = radio.setBandwidth(currentRadioBw());
+            state = radio.setBandwidth(cfgBw);
         }
 
         if (state == RADIOLIB_ERR_NONE) {
-            state = radio.setSpreadingFactor(currentRadioSf());
+            state = radio.setSpreadingFactor(cfgSf);
         }
 
         if (state == RADIOLIB_ERR_NONE) {
-            state = radio.setCodingRate(7);
+            state = radio.setCodingRate(cfgCr);
+        }
+
+        if (state == RADIOLIB_ERR_NONE) {
+            // MeshCore uses RadioLib's private sync word (0x12).
+            state = radio.setSyncWord(M33K_MESHCORE_SYNC);
         }
 
         if (state == RADIOLIB_ERR_NONE && restartReceive) {
@@ -5224,6 +5582,128 @@ void advanceRadioAutoProfile()
     }
 }
 
+// ---------------------------------------------------------------------------
+// MeshCore public-channel decode (Tier 1: receive-only).
+//
+// MeshCore's "Public" channel is a group channel with a well-known shared key.
+// A group-text packet's payload is:  channel_hash(1) | MAC(2) | AES-128-ECB
+// ciphertext, where the plaintext is  timestamp(4, LE) | "name: message".
+// Crypto here uses the ESP32 SDK's mbedtls (AES-128-ECB, HMAC-SHA256), so no
+// extra library is needed. This only READS the public channel - it does not
+// transmit, decrypt direct messages, or route/relay.
+// ---------------------------------------------------------------------------
+// The MeshCore public group key (base64 "izOH6cXN6mrJ5e26oRXNcg=="), 16 bytes.
+// This is MeshCore's universal public-channel key, not any personal data.
+static const uint8_t M33K_MESH_PUB_KEY[16] = {
+    0x8B, 0x33, 0x87, 0xE9, 0xC5, 0xCD, 0xEA, 0x6A,
+    0xC9, 0xE5, 0xED, 0xBA, 0xA1, 0x15, 0xCD, 0x72
+};
+uint8_t  m33kMeshPubChanHash = 0;
+bool     m33kMeshPubReady = false;
+
+void meshcoreInitPublic()
+{
+    if (m33kMeshPubReady) return;
+    uint8_t h[32];
+    // channel hash = SHA256(key)[0]  (key upper 16 bytes are zero -> hash 16).
+    mbedtls_sha256(M33K_MESH_PUB_KEY, sizeof(M33K_MESH_PUB_KEY), h, 0);
+    m33kMeshPubChanHash = h[0];
+    m33kMeshPubReady = true;
+}
+
+// Short human label for a MeshCore payload type (the 4 bits above the route).
+static const char *meshcorePayloadName(uint8_t payloadType)
+{
+    switch (payloadType) {
+        case 0x00: return "REQ";
+        case 0x01: return "RESP";
+        case 0x02: return "DIRECT";    // direct text, encrypted to one node
+        case 0x03: return "ACK";
+        case 0x04: return "ADVERT";    // node announcing itself
+        case 0x05: return "GRP_TXT";   // public/group text message
+        case 0x06: return "GRP_DATA";
+        case 0x07: return "ANON_REQ";
+        case 0x08: return "PATH";
+        case 0x09: return "TRACE";
+        case 0x0A: return "MPART";
+        case 0x0B: return "CONTROL";
+        case 0x0F: return "RAW";
+        default:   return "?";
+    }
+}
+
+// Try to decode a received frame as a MeshCore public-channel text message.
+// Returns true and fills `out` ("name: message") on success.
+bool meshcoreDecodePublic(const uint8_t *frame, size_t len, String &out)
+{
+    meshcoreInitPublic();
+    if (len < 3) return false;
+
+    size_t i = 0;
+    const uint8_t header = frame[i++];
+    const uint8_t routeType   = header & 0x03;
+    const uint8_t payloadType = (header >> 2) & 0x0F;
+    if (payloadType != 0x05) return false;            // PAYLOAD_TYPE_GRP_TXT
+
+    if (routeType == 0x00 || routeType == 0x03) i += 4;  // transport codes
+    if (i >= len) return false;
+
+    const uint8_t pathLenByte = frame[i++];
+    const uint8_t hashSize = ((pathLenByte >> 6) & 0x03) + 1;
+    const uint8_t hashCnt  = pathLenByte & 0x3F;
+    i += (size_t)hashSize * hashCnt;                  // skip routing path
+    if (i >= len) return false;
+
+    // Payload: channel_hash(1) | MAC(2) | ciphertext (AES blocks).
+    if (frame[i] != m33kMeshPubChanHash) return false;  // not the public channel
+    i++;
+    const uint8_t *macAndCipher = &frame[i];
+    const int bodyLen = (int)(len - i);
+    if (bodyLen <= 2) return false;
+    const int cipherLen = bodyLen - 2;                // after 2-byte MAC
+    if (cipherLen <= 0 || (cipherLen % 16) != 0) return false;
+
+    // Verify the 2-byte HMAC-SHA256 MAC over the ciphertext (key = 32 bytes:
+    // the 16-byte PSK followed by 16 zero bytes, matching MeshCore).
+    uint8_t keyFull[32] = {};
+    memcpy(keyFull, M33K_MESH_PUB_KEY, 16);
+    uint8_t mac[32];
+    const mbedtls_md_info_t *md = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+    if (!md) return false;
+    if (mbedtls_md_hmac(md, keyFull, 32, macAndCipher + 2, cipherLen, mac) != 0)
+        return false;
+    if (mac[0] != macAndCipher[0] || mac[1] != macAndCipher[1]) return false;
+
+    // AES-128-ECB decrypt the ciphertext.
+    uint8_t plain[192];
+    if (cipherLen > (int)sizeof(plain)) return false;
+    mbedtls_aes_context aes;
+    mbedtls_aes_init(&aes);
+    mbedtls_aes_setkey_dec(&aes, M33K_MESH_PUB_KEY, 128);
+    for (int off = 0; off < cipherLen; off += 16)
+        mbedtls_aes_crypt_ecb(&aes, MBEDTLS_AES_DECRYPT,
+                              macAndCipher + 2 + off, plain + off);
+    mbedtls_aes_free(&aes);
+
+    // Plaintext = timestamp(4, LE) + "name: message". Skip the timestamp and
+    // take the readable text up to the first NUL / padding.
+    if (cipherLen <= 4) return false;
+    const char *txt = (const char *)(plain + 4);
+    const int txtMax = cipherLen - 4;
+    int n = 0;
+    while (n < txtMax && txt[n] != '\0') ++n;
+    // Trim any non-printable trailing bytes (ECB zero/era padding).
+    while (n > 0 && (uint8_t)txt[n - 1] < 0x20) --n;
+    if (n <= 0) return false;
+
+    out = "";
+    for (int k = 0; k < n; ++k) {
+        const uint8_t c = (uint8_t)txt[k];
+        out += (c >= 0x20 && c <= 0x7E) ? (char)c : '.';
+    }
+    return out.length() > 0;
+}
+
 void radioTimerCb(lv_timer_t *timer)
 {
     LV_UNUSED(timer);
@@ -5248,7 +5728,7 @@ void radioTimerCb(lv_timer_t *timer)
         m33kRadioPacketFlag = false;
 
         int16_t state = -999;
-        uint8_t data[96] = {};
+        uint8_t data[256] = {};   // large enough for a full MeshCore frame
         size_t packetLen = 0;
         size_t readLen = 0;
         float rssi = -127.0f;
@@ -5283,13 +5763,38 @@ void radioTimerCb(lv_timer_t *timer)
             m33kRadioLastFreqError = freqError;
             m33kRadioLastLength = packetLen;
 
+            // MeshCore public-channel decode takes over the entry when the
+            // preset is on and the frame decodes as a public group message.
+            String meshMsg;
+            if (m33kRadioMeshCore && meshcoreDecodePublic(data, readLen, meshMsg)) {
+                String e = "MESH #";
+                e += String(m33kRadioPacketCount);
+                e += "  ";
+                e += String(rssi, 0);
+                e += " dBm\n";
+                e += meshMsg;
+                pushRadioHistory(e);
+                if (radioStatusLabel) {
+                    lv_label_set_text(radioStatusLabel,
+                        "MESHCORE | PUBLIC MSG DECODED");
+                    lv_obj_set_style_text_color(radioStatusLabel,
+                        lv_color_hex(0x7CFF45), 0);
+                }
+            } else {
+
             String entry;
             entry += "#";
             entry += String(m33kRadioPacketCount);
+            if (m33kRadioMeshCore && readLen >= 1) {
+                // Label the packet by its MeshCore type (a GRP_TXT shown here
+                // is a public message that failed to decrypt/parse).
+                entry += "  ";
+                entry += meshcorePayloadName((data[0] >> 2) & 0x0F);
+            }
             entry += "  SF";
-            entry += String(currentRadioSf());
+            entry += String((int)(m33kRadioMeshCore ? M33K_MESHCORE_SF : currentRadioSf()));
             entry += " BW";
-            entry += String((int)currentRadioBw());
+            entry += String((int)(m33kRadioMeshCore ? M33K_MESHCORE_BW_KHZ : currentRadioBw()));
             entry += "\n";
             entry += String(rssi, 1);
             entry += " dBm  SNR ";
@@ -5344,6 +5849,7 @@ void radioTimerCb(lv_timer_t *timer)
                     0
                 );
             }
+            }  // end else (non-MeshCore or undecoded frame)
         } else if (state == RADIOLIB_ERR_CRC_MISMATCH) {
             if (radioStatusLabel) {
                 lv_label_set_text(
@@ -5413,6 +5919,12 @@ void radioSfEvent(lv_event_t *e)
     noteActivity();
     hapticTap();
 
+    if (m33kRadioMeshCore) {
+        if (radioStatusLabel) lv_label_set_text(radioStatusLabel,
+            "MeshCore preset active - turn MESH off to tune SF/BW");
+        return;
+    }
+
     m33kRadioAutoScan = false;
     m33kRadioSfIndex =
         (m33kRadioSfIndex + 1) % M33K_RADIO_SF_COUNT;
@@ -5440,6 +5952,12 @@ void radioBwEvent(lv_event_t *e)
 
     noteActivity();
     hapticTap();
+
+    if (m33kRadioMeshCore) {
+        if (radioStatusLabel) lv_label_set_text(radioStatusLabel,
+            "MeshCore preset active - turn MESH off to tune SF/BW");
+        return;
+    }
 
     m33kRadioAutoScan = false;
     m33kRadioBwIndex =
@@ -5469,6 +5987,12 @@ void radioAutoEvent(lv_event_t *e)
     noteActivity();
     hapticTap();
 
+    if (m33kRadioMeshCore) {
+        if (radioStatusLabel) lv_label_set_text(radioStatusLabel,
+            "MeshCore preset active - turn MESH off for AUTO");
+        return;
+    }
+
     m33kRadioAutoScan = !m33kRadioAutoScan;
 
     if (m33kRadioAutoScan) {
@@ -5480,6 +6004,34 @@ void radioAutoEvent(lv_event_t *e)
         }
     }
 
+    updateRadioMonitorUi();
+}
+
+void radioMeshEvent(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED ||
+        !clickAllowed()) return;
+
+    noteActivity();
+    hapticTap();
+
+    m33kRadioMeshCore = !m33kRadioMeshCore;
+    if (m33kRadioMeshCore) m33kRadioAutoScan = false;   // preset overrides auto
+
+    if (m33kRadioInitialized) {
+        applyRadioProfile(m33kRadioListening);
+    }
+
+    if (radioStatusLabel) {
+        lv_label_set_text(
+            radioStatusLabel,
+            m33kRadioMeshCore
+                ? "MESHCORE LISTEN | 910.525 SF7 BW62.5"
+                : "GENERIC RX | 915 MHz"
+        );
+    }
+
+    updateRadioProfileLabels();
     updateRadioMonitorUi();
 }
 
@@ -6145,6 +6697,65 @@ void playHunterBeep()
 
 
 
+
+// ---- Game sound effects ----------------------------------------------------
+// Reuse the Signal Hunter speaker path (48 kHz stereo I2S) and its PCM buffer.
+// The games and the Hunter never run at the same time, so sharing the buffer is
+// safe; we flag the Hunter beep dirty so it regenerates its own tone next time.
+// Tones are kept short so the blocking I2S write barely dents the game tick.
+bool gameAudioReady = false;
+
+void gameAudioBegin()
+{
+    if (configureHunterAudio()) {
+        instance.powerControl(POWER_SPEAK, true);
+        gameAudioReady = hunterAudioConfigured;
+    } else {
+        gameAudioReady = false;
+    }
+}
+
+void gameAudioEnd()
+{
+    if (!gameAudioReady && !hunterAudioConfigured) return;
+    instance.powerControl(POWER_SPEAK, false);
+    if (hunterAudioConfigured) { instance.player.end(); hunterAudioConfigured = false; }
+    gameAudioReady = false;
+}
+
+// Synthesize a short sine sweep (f0 -> f1) with click-free attack/release and
+// play it. Capped to the shared buffer length (~90 ms).
+void gamePlayTone(float f0, float f1, int ms, float vol)
+{
+    if (!gameAudioReady) return;
+    int frames = HUNTER_AUDIO_RATE * ms / 1000;
+    if (frames > HUNTER_BEEP_FRAMES) frames = HUNTER_BEEP_FRAMES;
+    if (frames < 1) return;
+    const int atk = (frames / 6) > 1 ? frames / 6 : 1;
+    const int rel = (frames / 4) > 1 ? frames / 4 : 1;
+    float phase = 0.0f;
+    for (int i = 0; i < frames; ++i) {
+        const float t = (float)i / (float)frames;
+        const float f = f0 + (f1 - f0) * t;
+        phase += 2.0f * PI * f / (float)HUNTER_AUDIO_RATE;
+        float env = 1.0f;
+        if (i < atk) env = (float)i / (float)atk;
+        else if (i > frames - rel) env = (float)(frames - i) / (float)rel;
+        const int16_t pcm = (int16_t)(32767.0f * vol * env * sinf(phase));
+        hunterBeepBuffer[i * 2] = pcm;
+        hunterBeepBuffer[i * 2 + 1] = pcm;
+    }
+    hunterBeepReady = false;   // Hunter will rebuild its own beep when next used
+    instance.player.write(reinterpret_cast<uint8_t *>(hunterBeepBuffer),
+                          frames * 2 * sizeof(int16_t));
+}
+
+void sfxJump()    { gamePlayTone(480.0f, 900.0f, 24, 0.50f); }
+void sfxFlap()    { gamePlayTone(680.0f, 1040.0f, 14, 0.40f); }
+void sfxShoot()   { gamePlayTone(1750.0f, 1050.0f, 12, 0.45f); }
+void sfxPop()     { gamePlayTone(320.0f, 90.0f, 22, 0.55f); }
+void sfxCollect() { gamePlayTone(760.0f, 1340.0f, 26, 0.50f); }
+void sfxDie()     { gamePlayTone(680.0f, 110.0f, 85, 0.60f); }
 
 uint32_t hunterFeedbackInterval(int rssi)
 {
@@ -9290,6 +9901,13 @@ void feedGpsSerial()
         }
     }
 
+    // TEMP DIAGNOSTIC: while on the GPS page, print the raw GNSS stream a few
+    // lines per second so we can tell valid NMEA ("$GPGGA,..." text) from
+    // baud-mismatch garbage (mostly dots). Remove once GPS is sorted.
+    static char gpsRawLine[140];
+    static uint8_t gpsRawLen = 0;
+    static uint32_t gpsRawLastMs = 0;
+
     bool receivedByte = false;
     while (Serial1.available() > 0) {
         const int c = Serial1.read();
@@ -9299,6 +9917,16 @@ void feedGpsSerial()
         gpsParser.encode(static_cast<char>(c));
         ++gpsSessionBytes;
         gpsLastByteMs = millis();
+
+        if (currentPage == Page::GPS) {
+            if (c == '\n' || gpsRawLen >= sizeof(gpsRawLine) - 1) {
+                gpsRawLine[gpsRawLen] = 0;
+                // (raw NMEA serial dump removed for public builds)
+                gpsRawLen = 0;
+            } else if (c != '\r') {
+                gpsRawLine[gpsRawLen++] = (c >= 32 && c < 127) ? (char)c : '.';
+            }
+        }
 
         if (gpsParser.location.isUpdated()) {
             gpsSessionLocationSeen = true;
@@ -9837,6 +10465,11 @@ void stopWifiTool()
         lv_timer_del(wifiTimer);
         wifiTimer = nullptr;
     }
+    if (wifiMascotTimer) {
+        lv_timer_del(wifiMascotTimer);
+        wifiMascotTimer = nullptr;
+    }
+    wifiMascot = nullptr;
 
     if (wifiScanning || WiFi.scanComplete() >= 0) {
         WiFi.scanDelete();
@@ -9865,6 +10498,11 @@ void clearPageTimers()
         matrixTimer = nullptr;
     }
 
+    if (faceAnimTimer) {
+        lv_timer_del(faceAnimTimer);
+        faceAnimTimer = nullptr;
+    }
+
     if (homeLiveTimer) {
         lv_timer_del(homeLiveTimer);
         homeLiveTimer = nullptr;
@@ -9890,6 +10528,15 @@ void clearPageTimers()
         lv_timer_del(radioTimer);
         radioTimer = nullptr;
     }
+    if (bleAnimTimer) {
+        lv_timer_del(bleAnimTimer);
+        bleAnimTimer = nullptr;
+    }
+    if (gameTimer) {
+        lv_timer_del(gameTimer);
+        gameTimer = nullptr;
+    }
+    stopGameTool();
     reconPhase = ReconPhase::Idle;
 
     stopWatchTool();
@@ -9936,6 +10583,8 @@ void resetLivePointers()
 
     bleStatusLabel = nullptr;
     bleList = nullptr;
+    bleCat = nullptr;
+    blePingRing = nullptr;
     bleDetailOverlay = nullptr;
     bleDetailTitle = nullptr;
     bleDetailBody = nullptr;
@@ -10017,6 +10666,7 @@ void resetLivePointers()
     radioSfButtonLabel = nullptr;
     radioBwButtonLabel = nullptr;
     radioAutoButtonLabel = nullptr;
+    radioMeshButtonLabel = nullptr;
 
     radarStatusLabel = nullptr;
     radarInfoLabel = nullptr;
@@ -10188,9 +10838,16 @@ void createTopBar()
     lv_obj_set_style_text_font(batteryLabel, &lv_font_montserrat_14, 0);
     lv_obj_set_pos(batteryLabel, 24, 7);
 
+    // On the terminal face the decorative top icons (separators, BLE, GPS) take
+    // the terminal readout color; battery stays green and Wi-Fi/C5 keep their
+    // live status colors.
+    const uint32_t topIcon = dockIconColorOverride ? dockIconColorOverride : 0x6B8299;
+    const uint32_t bleCol  = dockIconColorOverride ? dockIconColorOverride : 0x6D86FF;
+    const uint32_t gpsCol  = dockIconColorOverride ? dockIconColorOverride : 0xF5FF3B;
+
     lv_obj_t *sep1 = lv_label_create(top);
     lv_label_set_text(sep1, "|");
-    lv_obj_set_style_text_color(sep1, lv_color_hex(0x6B8299), 0);
+    lv_obj_set_style_text_color(sep1, lv_color_hex(topIcon), 0);
     lv_obj_set_pos(sep1, 95, 7);
 
     homeWifiIcon = lv_label_create(top);
@@ -10209,7 +10866,7 @@ void createTopBar()
 
     lv_obj_t *sep2 = lv_label_create(top);
     lv_label_set_text(sep2, "|");
-    lv_obj_set_style_text_color(sep2, lv_color_hex(0x6B8299), 0);
+    lv_obj_set_style_text_color(sep2, lv_color_hex(topIcon), 0);
     lv_obj_set_pos(sep2, 147, 7);
 
     homeC5Label = lv_label_create(top);
@@ -10228,23 +10885,23 @@ void createTopBar()
 
     lv_obj_t *sep3 = lv_label_create(top);
     lv_label_set_text(sep3, "|");
-    lv_obj_set_style_text_color(sep3, lv_color_hex(0x6B8299), 0);
+    lv_obj_set_style_text_color(sep3, lv_color_hex(topIcon), 0);
     lv_obj_set_pos(sep3, 197, 7);
 
     lv_obj_t *ble = lv_label_create(top);
     lv_label_set_text(ble, LV_SYMBOL_BLUETOOTH);
-    lv_obj_set_style_text_color(ble, lv_color_hex(0x6D86FF), 0);
+    lv_obj_set_style_text_color(ble, lv_color_hex(bleCol), 0);
     lv_obj_set_style_text_font(ble, &lv_font_montserrat_16, 0);
     lv_obj_set_pos(ble, 214, 6);
 
     lv_obj_t *sep4 = lv_label_create(top);
     lv_label_set_text(sep4, "|");
-    lv_obj_set_style_text_color(sep4, lv_color_hex(0x6B8299), 0);
+    lv_obj_set_style_text_color(sep4, lv_color_hex(topIcon), 0);
     lv_obj_set_pos(sep4, 246, 7);
 
     lv_obj_t *gps = lv_label_create(top);
     lv_label_set_text(gps, LV_SYMBOL_GPS);
-    lv_obj_set_style_text_color(gps, lv_color_hex(0xF5FF3B), 0);
+    lv_obj_set_style_text_color(gps, lv_color_hex(gpsCol), 0);
     lv_obj_set_style_text_font(gps, &lv_font_montserrat_16, 0);
     lv_obj_set_pos(gps, 264, 6);
 }
@@ -10507,11 +11164,13 @@ void dockEvent(lv_event_t *e)
     } else if (item->page == Page::GPS) {
         showGpsPage();
     } else if (item->page == Page::NFC) {
-        showPlaceholder(Page::NFC, "NFC - IN PROGRESS");
+        showNfcPage();
     } else if (item->page == Page::Logs) {
         showLogsPage();
     } else if (item->page == Page::Settings) {
         showSettingsPage();
+    } else if (item->page == Page::Game) {
+        showGamePage();
     } else {
         showPlaceholder(item->page, item->label);
     }
@@ -10520,10 +11179,11 @@ void dockEvent(lv_event_t *e)
 void createDock()
 {
     // Larger hit areas than v0.2.x, while staying away from rounded corners.
-    constexpr int16_t buttonW = 44;
+    // Sized to fit eight icons (Game added) across the 410 px screen.
+    constexpr int16_t buttonW = 40;
     constexpr int16_t buttonH = 54;
-    constexpr int16_t gap = 8;
-    int16_t x = 27;
+    constexpr int16_t gap = 6;
+    int16_t x = 24;
 
     for (const auto &item : dock) {
         lv_obj_t *btn = lv_button_create(screen);
@@ -10542,11 +11202,2323 @@ void createDock()
 
         lv_obj_t *icon = lv_label_create(btn);
         lv_label_set_text(icon, item.icon);
-        lv_obj_set_style_text_color(icon, lv_color_hex(item.iconColorHex), 0);
+        const uint32_t iconCol = dockIconColorOverride ? dockIconColorOverride
+                                                       : item.iconColorHex;
+        lv_obj_set_style_text_color(icon, lv_color_hex(iconCol), 0);
         lv_obj_set_style_text_font(icon, &lv_font_montserrat_22, 0);
         lv_obj_center(icon);
 
         x += buttonW + gap;
+    }
+}
+
+// Refresh the live clock on the alternate faces (the Original face keeps using
+// updateHomeLiveData()). Safe to call on any face; null pointers are skipped.
+void updateFaceClock()
+{
+    if (homeFaceIndex == 0) return;
+
+    RTC_DateTime dt = instance.rtc.getDateTime();
+    uint8_t h24 = dt.getHour();
+    uint8_t dh = h24;
+    if (!use24Hour) { dh = h24 % 12; if (dh == 0) dh = 12; }
+
+    char hb[4], mb[4], sb[4];
+    if (use24Hour) snprintf(hb, sizeof(hb), "%02u", dh);
+    else           snprintf(hb, sizeof(hb), "%u", dh);
+    snprintf(mb, sizeof(mb), "%02u", dt.getMinute());
+    snprintf(sb, sizeof(sb), "%02u", dt.getSecond());
+
+    uint8_t mon = dt.getMonth(); if (mon < 1 || mon > 12) mon = 1;
+    struct tm rt = dt.toUnixTime();
+    uint8_t wk = static_cast<uint8_t>(rt.tm_wday); if (wk > 6) wk = 0;
+
+    if (faceClockHour) lv_label_set_text(faceClockHour, hb);
+    if (faceClockMin)  lv_label_set_text(faceClockMin, mb);
+    if (faceClockDate)
+        lv_label_set_text_fmt(faceClockDate, "%s  %s %u", WEEKDAYS[wk],
+                              MONTHS[mon - 1], dt.getDay());
+    if (termTime) lv_label_set_text_fmt(termTime, "%s:%s:%s", hb, mb, sb);
+    if (termDate)
+        lv_label_set_text_fmt(termDate, "%s %02u-%02u", WEEKDAYS[wk], mon,
+                              dt.getDay());
+    if (termBatt) {
+        int pct = instance.pmu.getBatteryPercent();
+        if (pct >= 0) lv_label_set_text_fmt(termBatt, "%d%%  NET UP", pct);
+        else          lv_label_set_text(termBatt, "--   NET UP");
+    }
+}
+
+// 7-segment masks for digits 0-9 (bit i = segment i in order a,b,c,d,e,f,g).
+static const uint8_t RADAR_SEG7[10] = {
+    0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07, 0x7F, 0x6F
+};
+
+// Light/dim one digit cell's 7 segments for a value (-1 = blank).
+static void radarSetDigit(int cell, int value)
+{
+    if (cell < 0 || cell > 3) return;
+    uint8_t mask = (value >= 0 && value <= 9) ? RADAR_SEG7[value] : 0x00;
+    for (int i = 0; i < 7; ++i) {
+        lv_obj_t *s = radarSeg[cell][i];
+        if (!s) continue;
+        const bool on = (mask >> i) & 1;
+        lv_obj_set_style_bg_color(s, lv_color_hex(on ? RADAR_NEON : 0x0B3D12), 0);
+        lv_obj_set_style_bg_opa(s, on ? LV_OPA_COVER : 90, 0);
+        lv_obj_set_style_shadow_opa(s, on ? 180 : 0, 0);
+    }
+}
+
+// Refresh the Radar face's 7-seg time and the vertical day/date.
+void updateRadarClock()
+{
+    RTC_DateTime dt = instance.rtc.getDateTime();
+    uint8_t h24 = dt.getHour(), dh = h24;
+    if (!use24Hour) { dh = h24 % 12; if (dh == 0) dh = 12; }
+    int htens = dh / 10, hones = dh % 10;
+    if (!use24Hour && htens == 0) htens = -1;   // blank the leading zero in 12h
+    radarSetDigit(0, htens);
+    radarSetDigit(1, hones);
+    radarSetDigit(2, dt.getMinute() / 10);
+    radarSetDigit(3, dt.getMinute() % 10);
+
+    uint8_t mon = dt.getMonth(); if (mon < 1 || mon > 12) mon = 1;
+    struct tm rt = dt.toUnixTime();
+    uint8_t wk = static_cast<uint8_t>(rt.tm_wday); if (wk > 6) wk = 0;
+    if (radarMetaDay)  lv_label_set_text(radarMetaDay, WEEKDAYS[wk]);
+    if (radarMetaDate) lv_label_set_text_fmt(radarMetaDate, "%s %u", MONTHS[mon - 1], dt.getDay());
+}
+
+// 50 ms animation driver for the alternate faces (cursor blink, character
+// sway/tail twitch, video flipbook). Torn down in clearPageTimers().
+void buildWeatherFace();
+void serviceWeatherFetch();
+
+// Weather scenes, chosen from the WMO weather_code so the backdrop matches the
+// real conditions instead of a timed loop.
+enum WxScene : uint8_t { WX_CLEAR, WX_CLOUD, WX_FOG, WX_RAIN, WX_SNOW, WX_STORM };
+static WxScene wxSceneForCode(int code)
+{
+    if (code < 0)                         return WX_CLEAR;   // no data yet
+    if (code == 0 || code == 1)           return WX_CLEAR;   // clear / mainly clear
+    if (code == 2 || code == 3)           return WX_CLOUD;   // partly cloudy / overcast
+    if (code == 45 || code == 48)         return WX_FOG;     // fog
+    if ((code >= 51 && code <= 67) ||
+        (code >= 80 && code <= 82))       return WX_RAIN;    // drizzle / rain / showers
+    if ((code >= 71 && code <= 77) ||
+         code == 85 || code == 86)        return WX_SNOW;    // snow
+    if (code >= 95)                       return WX_STORM;   // thunderstorm
+    return WX_CLOUD;
+}
+
+void faceAnimTick(lv_timer_t *timer)
+{
+    LV_UNUSED(timer);
+    if (currentPage != Page::Home) return;
+    const uint32_t now = millis();
+    const float ph = (now - faceAnimStartMs) / 1000.0f;
+
+    if (homeFaceIndex == 1) {
+        if (termCursor && (now - termCursorMs >= 500)) {
+            termCursorMs = now; termCursorOn = !termCursorOn;
+            lv_obj_set_style_opa(termCursor, termCursorOn ? 255 : 0, 0);
+        }
+    } else if (homeFaceIndex == 2) {
+        if (crewMain) lv_image_set_rotation(crewMain,
+            static_cast<int32_t>(sinf(ph * 1.5f) * 16.0f));
+        const int catBob = static_cast<int>(sinf(ph * 1.1f) * 3.0f);
+        const int monBob = static_cast<int>(sinf(ph * 1.3f + 1.0f) * 3.0f);
+        if (crewCatBody) lv_obj_set_y(crewCatBody, crewCatBaseY + catBob);
+        if (crewCatTail) {
+            lv_obj_set_y(crewCatTail, crewCatBaseY + catBob);
+            lv_image_set_rotation(crewCatTail,
+                static_cast<int32_t>(sinf(ph * 3.0f) * 70.0f));
+        }
+        if (crewMonBody) lv_obj_set_y(crewMonBody, crewMonBaseY + monBob);
+        if (crewMonTail) {
+            lv_obj_set_y(crewMonTail, crewMonBaseY + monBob);
+            lv_image_set_rotation(crewMonTail,
+                static_cast<int32_t>(sinf(ph * 2.4f + 2.0f) * 60.0f));
+        }
+    } else if (homeFaceIndex == 3) {
+        if (videoImg && m33k_video_frame_count > 0 &&
+            (now - videoFrameMs >= 130)) {
+            videoFrameMs = now;
+            videoFrameIdx = (videoFrameIdx + 1) % m33k_video_frame_count;
+            lv_image_set_src(videoImg, m33k_video_frames[videoFrameIdx]);
+        }
+    } else if (homeFaceIndex == 4) {
+        // Background bubbles drift down and wrap at the top.
+        for (int i = 0; i < BG_BUBBLE_COUNT; ++i) {
+            BubbleEntity &b = gBgBubbles[i];
+            if (!b.obj) continue;
+            b.y += b.speed;
+            b.phase += 0.02f;
+            if (b.y > 502.0f + b.size) { b.y = -(float)b.size; b.x = rand() % 410; }
+            lv_obj_set_pos(b.obj, (int)b.x + (int)(sinf(b.phase) * b.swayAmp), (int)b.y);
+        }
+        // Character bubbles float up and wrap at the bottom.
+        for (int i = 0; i < BUBBLE_COUNT; ++i) {
+            BubbleEntity &b = gBubbles[i];
+            if (!b.obj) continue;
+            b.y -= b.speed;
+            b.phase += 0.016f;   // gentle sway, scaled for the 33 ms tick
+            if (b.y < -(float)b.size - 4.0f) { bubbleRespawn(i, false); continue; }
+            lv_obj_set_pos(b.obj, (int)b.x + (int)(sinf(b.phase) * b.swayAmp), (int)b.y);
+        }
+        // Flashy clock: cycle the hour / minute / date through neon hues.
+        const uint16_t h1 = (uint16_t)((now / 12) % 360);
+        const uint16_t h2 = (uint16_t)((h1 + 140) % 360);
+        if (faceClockHour)  lv_obj_set_style_text_color(faceClockHour,  lv_color_hsv_to_rgb(h1, 100, 100), 0);
+        if (faceClockMin)   lv_obj_set_style_text_color(faceClockMin,   lv_color_hsv_to_rgb(h2, 100, 100), 0);
+        if (faceClockColon) lv_obj_set_style_text_color(faceClockColon, lv_color_hex(0xFFFFFF), 0);
+        if (faceClockDate)  lv_obj_set_style_text_color(faceClockDate,  lv_color_hsv_to_rgb(h1, 80, 100), 0);
+    } else if (homeFaceIndex == 5) {
+        // Weather backdrop driven by the real condition (WMO weather_code)
+        // plus day/night, instead of a timed storm->sun loop.
+        const WxScene scene = wxSceneForCode(weatherCode);
+        // Day/night from the RTC, cached (no need to hit I2C 30x/second).
+        static bool wxIsDayCached = true;
+        static uint32_t wxDayCheckMs = 0;
+        if (wxDayCheckMs == 0 || now - wxDayCheckMs > 5000) {
+            wxDayCheckMs = now;
+            const int hr = (int)instance.rtc.getDateTime().getHour();
+            wxIsDayCached = (hr >= 6 && hr < 19);
+        }
+        const bool isDay = wxIsDayCached;
+        // Wind scales drift/fall speed (1.0 calm ... ~2.6 very gusty).
+        const float windF = 1.0f + (weatherWindMph > 6.0f
+                            ? fminf((weatherWindMph - 6.0f) / 16.0f, 1.6f) : 0.0f);
+
+        const bool showSun    = (scene == WX_CLEAR && isDay);
+        const bool showMoon   = (scene == WX_CLEAR && !isDay);
+        const bool showBird   = (scene == WX_CLEAR && isDay);
+        const bool showClouds = (scene == WX_CLOUD || scene == WX_RAIN ||
+                                 scene == WX_SNOW  || scene == WX_STORM ||
+                                 (scene == WX_CLEAR && isDay));
+        const bool showRain   = (scene == WX_RAIN || scene == WX_STORM);
+        const bool showSnow   = (scene == WX_SNOW);
+        const bool showFog    = (scene == WX_FOG);
+        const bool showStorm  = (scene == WX_STORM);
+        const bool showCity   = (scene == WX_STORM || scene == WX_RAIN);
+        const bool showMtn    = (scene == WX_CLEAR || scene == WX_CLOUD ||
+                                 scene == WX_FOG   || scene == WX_SNOW);
+
+        // Sky colour: bright day-blue when clear, progressively darker/greyer
+        // for cloud, fog, rain, snow and storm, and darker still at night.
+        uint32_t sky;
+        switch (scene) {
+            case WX_CLEAR: sky = isDay ? 0x2E7CC8 : 0x0A1430; break;
+            case WX_CLOUD: sky = isDay ? 0x4A6378 : 0x11203A; break;
+            case WX_FOG:   sky = isDay ? 0x6E7E8C : 0x1A2230; break;
+            case WX_RAIN:  sky = isDay ? 0x37485C : 0x0D1726; break;
+            case WX_SNOW:  sky = isDay ? 0x5A6E86 : 0x14203A; break;
+            default:       sky = 0x0A1024; break;   // storm
+        }
+        if (wxBg) lv_obj_set_style_bg_color(wxBg, lv_color_hex(sky), 0);
+
+        // Sun (clear day): soft glow pulse.
+        if (wxSun) {
+            lv_obj_set_style_opa(wxSun, showSun ? 255 : 0, 0);
+            if (showSun) lv_obj_set_style_shadow_width(wxSun,
+                (int)(30 + 16 * (0.5f + 0.5f * sinf(ph * 2.0f))), 0);
+        }
+        // Moon + twinkling stars (clear night).
+        if (wxMoon) lv_obj_set_style_opa(wxMoon, showMoon ? 255 : 0, 0);
+        for (int i = 0; i < WX_STAR_N; ++i) {
+            if (!wxStars[i]) continue;
+            if (showMoon) {
+                const float tw = 0.5f + 0.5f * sinf(ph * 2.2f + i * 0.9f);
+                lv_obj_set_style_opa(wxStars[i], (uint8_t)(120 + 135 * tw), 0);
+            } else lv_obj_set_style_opa(wxStars[i], 0, 0);
+        }
+        // Mountains / city skyline.
+        if (wxMtn)  lv_obj_set_style_opa(wxMtn,  showMtn  ? 255 : 0, 0);
+        if (wxCity) lv_obj_set_style_opa(wxCity, showCity ? 255 : 0, 0);
+
+        // Clouds drift (faster with wind).
+        auto driftCloud = [&](lv_obj_t *cl, float &cx, float base,
+                              int wrapNeg, uint8_t opa) {
+            if (!cl) return;
+            cx += base * windF; if (cx > 410) cx = (float)wrapNeg;
+            lv_obj_set_x(cl, (int)cx);
+            lv_obj_set_style_opa(cl, showClouds ? opa : 0, 0);
+        };
+        driftCloud(wxCloud1, wxCloud1X, 0.5f,  -100, 230);
+        driftCloud(wxCloud2, wxCloud2X, 0.35f,  -80, 210);
+
+        // Fog: two wide translucent bands sliding opposite ways.
+        if (wxFog1) {
+            wxFog1X += 0.25f * windF; if (wxFog1X > 150) wxFog1X = -260;
+            lv_obj_set_x(wxFog1, (int)wxFog1X);
+            lv_obj_set_style_opa(wxFog1, showFog ? 150 : 0, 0);
+        }
+        if (wxFog2) {
+            wxFog2X -= 0.18f * windF; if (wxFog2X < -260) wxFog2X = 150;
+            lv_obj_set_x(wxFog2, (int)wxFog2X);
+            lv_obj_set_style_opa(wxFog2, showFog ? 120 : 0, 0);
+        }
+
+        // Bird glides across and flaps (clear day only).
+        if (wxBird) {
+            if (showBird) {
+                wxBirdX += 0.8f;
+                if (wxBirdX > 440) { wxBirdX = -50; wxBirdY = 100 + (rand() % 38); }
+                lv_obj_set_pos(wxBird, (int)wxBirdX, wxBirdY);
+                lv_obj_set_style_opa(wxBird, 255, 0);
+                if (now - wxBirdFlapMs > 260) {
+                    wxBirdFlapMs = now; wxBirdWingsUp = !wxBirdWingsUp;
+                    static lv_point_precise_t up[5]   = { {0,9},{11,0},{22,9},{33,0},{44,9} };
+                    static lv_point_precise_t down[5] = { {0,2},{11,9},{22,2},{33,9},{44,2} };
+                    lv_line_set_points(wxBird, wxBirdWingsUp ? up : down, 5);
+                }
+            } else lv_obj_set_style_opa(wxBird, 0, 0);
+        }
+
+        // Rain: streaks falling, tilted by wind. Heavier (all drops) in storms.
+        const float rainTilt = (windF - 1.0f) * 2.2f;
+        for (int i = 0; i < WX_RAIN_N; ++i) {
+            if (!wxRain[i]) continue;
+            const bool active = showRain && (showStorm || i < 10);
+            if (!active) { lv_obj_set_style_opa(wxRain[i], 0, 0); continue; }
+            wxRainY[i] += wxRainSpd[i] * windF;
+            wxRainX[i] += rainTilt;
+            if (wxRainY[i] > 440) { wxRainY[i] = -20 - (rand() % 60); wxRainX[i] = rand() % 410; }
+            if (wxRainX[i] > 420) wxRainX[i] = 0;
+            lv_obj_set_pos(wxRain[i], (int)wxRainX[i], (int)wxRainY[i]);
+            lv_obj_set_style_opa(wxRain[i], 210, 0);
+        }
+        // Snow: slow flakes with a sideways sway.
+        for (int i = 0; i < WX_SNOW_N; ++i) {
+            if (!wxSnow[i]) continue;
+            if (!showSnow) { lv_obj_set_style_opa(wxSnow[i], 0, 0); continue; }
+            wxSnowY[i]  += wxSnowSpd[i];
+            wxSnowPh[i] += 0.03f;
+            if (wxSnowY[i] > 440) { wxSnowY[i] = -14 - (rand() % 60); wxSnowX[i] = rand() % 410; }
+            lv_obj_set_pos(wxSnow[i], (int)(wxSnowX[i] + sinf(wxSnowPh[i]) * 10.0f), (int)wxSnowY[i]);
+            lv_obj_set_style_opa(wxSnow[i], 235, 0);
+        }
+
+        // Lightning (storm only): a bright flare fading over ~0.55 s, strikes
+        // spaced 1.8-4.4 s apart so it reads like real lightning.
+        constexpr uint32_t FLASH_MS = 550;
+        if (showStorm && now >= wxNextFlashMs) {
+            wxFlashUntil = now + FLASH_MS;
+            wxNextFlashMs = now + 1800 + (rand() % 2600);
+        }
+        uint8_t flashOpa = 0, boltOpa = 0;
+        if (showStorm && now < wxFlashUntil) {
+            const float rem = (float)(wxFlashUntil - now) / (float)FLASH_MS;
+            flashOpa = (uint8_t)(170.0f * rem);
+            boltOpa  = (uint8_t)(255.0f * rem);
+        }
+        if (wxFlash) lv_obj_set_style_bg_opa(wxFlash, flashOpa, 0);
+        if (wxBolt)  lv_obj_set_style_opa(wxBolt, boltOpa, 0);
+    } else if (homeFaceIndex == 6) {
+        // Sweep hands spin in each eye.
+        radarSweepAng = (radarSweepAng + 60) % 3600;   // ~2 s / revolution
+        const int angR = (radarSweepAng + 1800) % 3600;
+        if (radarEyeL)     lv_obj_set_style_transform_rotation(radarEyeL, radarSweepAng, 0);
+        if (radarEyeLGlow) lv_obj_set_style_transform_rotation(radarEyeLGlow, radarSweepAng, 0);
+        if (radarEyeR)     lv_obj_set_style_transform_rotation(radarEyeR, angR, 0);
+        if (radarEyeRGlow) lv_obj_set_style_transform_rotation(radarEyeRGlow, angR, 0);
+        // Rings around each eye keep spinning (alternating directions).
+        if (now - radarRingMs > 33) {
+            radarRingMs = now;
+            for (int i = 0; i < 4; ++i) {
+                if (!radarRing[i]) continue;
+                radarRingAng[i] = (radarRingAng[i] + ((i & 1) ? 354 : 8)) % 360;
+                lv_arc_set_angles(radarRing[i], radarRingAng[i], radarRingAng[i] + 95);
+                if (radarRingGlow[i])
+                    lv_arc_set_angles(radarRingGlow[i], radarRingAng[i], radarRingAng[i] + 95);
+            }
+        }
+        // Cycling HUD readout between the eyes.
+        if (radarCenterTxt && now - radarTxtMs > 140) {
+            radarTxtMs = now;
+            char b[64];
+            snprintf(b, sizeof(b), "SCAN %02X\n%04X:%02X\nLOCK %02X\nSYNC %02X",
+                     (unsigned)(rand() & 0xFF), (unsigned)(rand() & 0xFFFF),
+                     (unsigned)(rand() & 0xFF), (unsigned)(rand() & 0xFF),
+                     (unsigned)(rand() & 0xFF));
+            lv_label_set_text(radarCenterTxt, b);
+        }
+        if (now - radarClockMs > 1000) { radarClockMs = now; updateRadarClock(); }
+    }
+}
+
+// A two-tone HH:MM clock (+ date line) centered near the top, shared by the
+// Crew and Video faces.
+void buildFaceClock(int y)
+{
+    faceClockHour = lv_label_create(screen);
+    lv_label_set_text(faceClockHour, "--");
+    lv_obj_set_style_text_font(faceClockHour, &lv_font_montserrat_44, 0);
+    lv_obj_set_style_text_color(faceClockHour, lv_color_hex(0x3AEFFF), 0);
+    // Fixed-width, right-aligned so a single-digit hour (e.g. "5") still sits
+    // flush against the colon instead of floating left of it.
+    lv_obj_set_width(faceClockHour, 60);
+    lv_obj_set_style_text_align(faceClockHour, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_obj_align(faceClockHour, LV_ALIGN_TOP_MID, -38, y);
+
+    faceClockColon = lv_label_create(screen);
+    lv_label_set_text(faceClockColon, ":");
+    lv_obj_set_style_text_font(faceClockColon, &lv_font_montserrat_44, 0);
+    lv_obj_set_style_text_color(faceClockColon, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_align(faceClockColon, LV_ALIGN_TOP_MID, 0, y);
+
+    faceClockMin = lv_label_create(screen);
+    lv_label_set_text(faceClockMin, "--");
+    lv_obj_set_style_text_font(faceClockMin, &lv_font_montserrat_44, 0);
+    lv_obj_set_style_text_color(faceClockMin, lv_color_hex(0xFF52C8), 0);
+    lv_obj_align(faceClockMin, LV_ALIGN_TOP_MID, 30, y);
+
+    faceClockDate = lv_label_create(screen);
+    lv_label_set_text(faceClockDate, "--");
+    lv_obj_set_style_text_font(faceClockDate, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(faceClockDate, lv_color_hex(0xCFE8FF), 0);
+    lv_obj_align(faceClockDate, LV_ALIGN_TOP_MID, 0, y + 54);
+}
+
+void buildTerminalFace()
+{
+    lv_obj_t *bg = lv_obj_create(screen);
+    lv_obj_remove_style_all(bg);
+    lv_obj_set_size(bg, 410, 502);
+    lv_obj_set_pos(bg, 0, 0);
+    lv_obj_set_style_bg_color(bg, lv_color_hex(0x02060A), 0);
+    lv_obj_set_style_bg_opa(bg, LV_OPA_COVER, 0);
+
+    // Green terminal rain behind the readout (kept visible, lightly dimmed).
+    matrixColA = 0x45FF8C;
+    matrixColB = 0x9CFFC4;
+    matrixSkullRecolor = 0xFFFFFF;    // white bunny skulls on this face
+    dockIconColorOverride = 0xCFFFE0; // dock icons match the terminal readout
+    createMatrixBackground();
+    lv_obj_t *shade = lv_obj_create(screen);
+    lv_obj_remove_style_all(shade);
+    lv_obj_set_size(shade, 410, 502);
+    lv_obj_set_pos(shade, 0, 0);
+    lv_obj_set_style_bg_color(shade, lv_color_hex(0x02060A), 0);
+    lv_obj_set_style_bg_opa(shade, 90, 0);
+
+    createTopBar();
+
+    const uint32_t green = 0x6CFF8F;
+    lv_obj_t *title = lv_label_create(screen);
+    lv_label_set_text(title, "M33K X");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_28, 0);
+    lv_obj_set_style_text_color(title, lv_color_hex(0xB6FFCF), 0);
+    lv_obj_set_pos(title, 40, 70);
+
+    lv_obj_t *boot = lv_label_create(screen);
+    lv_label_set_text(boot, "> booting............ ok");
+    lv_obj_set_style_text_font(boot, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(boot, lv_color_hex(green), 0);
+    lv_obj_set_pos(boot, 40, 120);
+
+    lv_obj_t *tl = lv_label_create(screen);
+    lv_label_set_text(tl, "> TIME");
+    lv_obj_set_style_text_font(tl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(tl, lv_color_hex(green), 0);
+    lv_obj_set_pos(tl, 40, 180);
+
+    termTime = lv_label_create(screen);
+    lv_label_set_text(termTime, "--:--:--");
+    lv_obj_set_style_text_font(termTime, &lv_font_montserrat_28, 0);
+    lv_obj_set_style_text_color(termTime, lv_color_hex(0xCFFFE0), 0);
+    lv_obj_set_pos(termTime, 150, 172);
+
+    lv_obj_t *dl = lv_label_create(screen);
+    lv_label_set_text(dl, "> DATE");
+    lv_obj_set_style_text_font(dl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(dl, lv_color_hex(green), 0);
+    lv_obj_set_pos(dl, 40, 230);
+    termDate = lv_label_create(screen);
+    lv_label_set_text(termDate, "---");
+    lv_obj_set_style_text_font(termDate, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(termDate, lv_color_hex(0xCFFFE0), 0);
+    lv_obj_set_pos(termDate, 150, 230);
+
+    lv_obj_t *bl = lv_label_create(screen);
+    lv_label_set_text(bl, "> BATT");
+    lv_obj_set_style_text_font(bl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(bl, lv_color_hex(green), 0);
+    lv_obj_set_pos(bl, 40, 270);
+    termBatt = lv_label_create(screen);
+    lv_label_set_text(termBatt, "--");
+    lv_obj_set_style_text_font(termBatt, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(termBatt, lv_color_hex(0xCFFFE0), 0);
+    lv_obj_set_pos(termBatt, 150, 270);
+
+    termCursor = lv_label_create(screen);
+    lv_label_set_text(termCursor, "> _");
+    lv_obj_set_style_text_font(termCursor, &lv_font_montserrat_22, 0);
+    lv_obj_set_style_text_color(termCursor, lv_color_hex(green), 0);
+    lv_obj_set_pos(termCursor, 40, 320);
+}
+
+void buildCrewFace()
+{
+    lv_obj_t *bg = lv_obj_create(screen);
+    lv_obj_remove_style_all(bg);
+    lv_obj_set_size(bg, 410, 502);
+    lv_obj_set_pos(bg, 0, 0);
+    lv_obj_set_style_bg_color(bg, lv_color_hex(0x04060E), 0);
+    lv_obj_set_style_bg_opa(bg, LV_OPA_COVER, 0);
+
+    // Reuse the matrix-rain + bunny-skull engine as the backdrop, slanted
+    // (diagonal rain) to set this face apart from the vertical ones.
+    matrixDriftX = 2;
+    createMatrixBackground();
+
+    createTopBar();
+
+    // Faint M33K / X graffiti.
+    lv_obj_t *graf = lv_label_create(screen);
+    lv_label_set_text(graf, "M33K");
+    lv_obj_set_style_text_font(graf, &lv_font_montserrat_44, 0);
+    lv_obj_set_style_text_color(graf, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_opa(graf, 34, 0);
+    lv_obj_set_pos(graf, 12, 150);
+    lv_obj_t *xg = lv_label_create(screen);
+    lv_label_set_text(xg, "X");
+    lv_obj_set_style_text_font(xg, &lv_font_montserrat_44, 0);
+    lv_obj_set_style_text_color(xg, lv_color_hex(0xFF52C8), 0);
+    lv_obj_set_style_text_opa(xg, 55, 0);
+    lv_obj_set_pos(xg, 44, 210);
+
+    // Characters: cat (left) and monkey (right) behind, main in front.
+    const int catW = m33k_cat_body.header.w, catH = m33k_cat_body.header.h;
+    const int monW = m33k_mon_body.header.w, monH = m33k_mon_body.header.h;
+    const int mw = m33k_main.header.w, mh = m33k_main.header.h;
+    crewCatBaseX = 6;            crewCatBaseY = 420 - catH;
+    crewMonBaseX = 410 - 6 - monW; crewMonBaseY = 420 - monH;
+
+    crewCatBody = lv_image_create(screen);
+    lv_image_set_src(crewCatBody, &m33k_cat_body);
+    lv_obj_set_pos(crewCatBody, crewCatBaseX, crewCatBaseY);
+    crewCatTail = lv_image_create(screen);
+    lv_image_set_src(crewCatTail, &m33k_cat_tail);
+    lv_obj_set_pos(crewCatTail, crewCatBaseX, crewCatBaseY);
+    lv_image_set_pivot(crewCatTail, (int)(catW * 0.40f), (int)(catH * 0.68f));
+
+    crewMonBody = lv_image_create(screen);
+    lv_image_set_src(crewMonBody, &m33k_mon_body);
+    lv_obj_set_pos(crewMonBody, crewMonBaseX, crewMonBaseY);
+    crewMonTail = lv_image_create(screen);
+    lv_image_set_src(crewMonTail, &m33k_mon_tail);
+    lv_obj_set_pos(crewMonTail, crewMonBaseX, crewMonBaseY);
+    lv_image_set_pivot(crewMonTail, (int)(monW * 0.62f), (int)(monH * 0.52f));
+
+    crewMain = lv_image_create(screen);
+    lv_image_set_src(crewMain, &m33k_main);
+    lv_obj_set_pos(crewMain, (410 - mw) / 2, 420 - mh);
+    lv_image_set_pivot(crewMain, mw / 2, mh);
+
+    lv_obj_t *imgs[5] = { crewCatBody, crewCatTail, crewMonBody, crewMonTail, crewMain };
+    for (int i = 0; i < 5; ++i) lv_obj_clear_flag(imgs[i], LV_OBJ_FLAG_CLICKABLE);
+
+    buildFaceClock(46);
+}
+
+void buildVideoFace()
+{
+    lv_obj_t *bg = lv_obj_create(screen);
+    lv_obj_remove_style_all(bg);
+    lv_obj_set_size(bg, 410, 502);
+    lv_obj_set_pos(bg, 0, 0);
+    lv_obj_set_style_bg_color(bg, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(bg, LV_OPA_COVER, 0);
+
+    if (m33k_video_frame_count > 0) {
+        const int vw = m33k_video_frames[0]->header.w;
+        const int vh = m33k_video_frames[0]->header.h;
+        videoImg = lv_image_create(screen);
+        lv_image_set_src(videoImg, m33k_video_frames[0]);
+        // Frames are stored at full screen size, so blit them directly (no
+        // runtime scaling): cheap to draw and keeps touch responsive.
+        lv_obj_set_pos(videoImg, (410 - vw) / 2, (502 - vh) / 2);
+        lv_obj_clear_flag(videoImg, LV_OBJ_FLAG_CLICKABLE);
+        videoFrameIdx = 0; videoFrameMs = millis();
+    }
+    createTopBar();
+    buildFaceClock(46);
+}
+
+// Radar face: a settled m33k t3ch frame with live overlays - a sweep hand and
+// spinning rings in each scope eye, a cycling readout between them, and the
+// time as sideways neon-green 7-segment digits with the day/date beside it.
+void buildRadarFace()
+{
+    lv_obj_t *bg = lv_obj_create(screen);
+    lv_obj_remove_style_all(bg);
+    lv_obj_set_size(bg, 410, 502);
+    lv_obj_set_pos(bg, 0, 0);
+    lv_obj_set_style_bg_color(bg, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(bg, LV_OPA_COVER, 0);
+
+    if (m33k_radar_frame_count > 0) {
+        radarFaceImg = lv_image_create(screen);
+        lv_image_set_src(radarFaceImg, m33k_radar_frames[0]);   // settled frame
+        lv_obj_set_pos(radarFaceImg, 0, 0);
+        lv_obj_clear_flag(radarFaceImg, LV_OBJ_FLAG_CLICKABLE);
+    }
+    radarSweepAng = 0; radarClockMs = 0; radarRingMs = 0; radarTxtMs = 0;
+
+    // Two spinning rings around each eye (an arc segment that rotates), each
+    // with a soft wide halo of the same color beneath so the ring glows.
+    auto makeRing = [&](int cx, int cy, int r, uint32_t col,
+                        lv_obj_t **glowOut) -> lv_obj_t * {
+        auto mkArc = [&](int w, uint8_t opa) -> lv_obj_t * {
+            lv_obj_t *a = lv_arc_create(screen);
+            lv_obj_set_size(a, 2 * r, 2 * r);
+            lv_obj_set_pos(a, cx - r, cy - r);
+            lv_obj_clear_flag(a, (lv_obj_flag_t)(LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE));
+            lv_obj_set_style_arc_opa(a, 0, LV_PART_MAIN);            // hide bg track
+            lv_obj_set_style_bg_opa(a, 0, LV_PART_KNOB);             // hide knob
+            lv_obj_set_style_arc_color(a, lv_color_hex(col), LV_PART_INDICATOR);
+            lv_obj_set_style_arc_width(a, w, LV_PART_INDICATOR);
+            lv_obj_set_style_arc_opa(a, opa, LV_PART_INDICATOR);
+            lv_arc_set_bg_angles(a, 0, 360);
+            lv_arc_set_angles(a, 0, 95);
+            return a;
+        };
+        lv_obj_t *glow = mkArc(12, 70);     // soft wide halo
+        if (glowOut) *glowOut = glow;
+        return mkArc(3, 230);               // sharp ring on top
+    };
+    radarRing[0] = makeRing(RADAR_LX, RADAR_LY, RADAR_ER,      0x4DF0FF, &radarRingGlow[0]);
+    radarRing[1] = makeRing(RADAR_LX, RADAR_LY, RADAR_ER - 16, RADAR_NEON, &radarRingGlow[1]);
+    radarRing[2] = makeRing(RADAR_RX, RADAR_RY, RADAR_ER,      0x4DF0FF, &radarRingGlow[2]);
+    radarRing[3] = makeRing(RADAR_RX, RADAR_RY, RADAR_ER - 16, RADAR_NEON, &radarRingGlow[3]);
+    for (int i = 0; i < 4; ++i) radarRingAng[i] = (i * 90) % 360;
+
+    // A rotating radial sweep hand over each eye, with a soft wide pink halo
+    // beneath the sharp line to make it glow. Both pivot at the eye center.
+    auto makeEye = [&](lv_point_precise_t *pts, int cx, int cy, int r,
+                       lv_obj_t **glowOut) -> lv_obj_t * {
+        pts[0].x = 0;  pts[0].y = 0;
+        pts[1].x = r;  pts[1].y = 0;
+        // glow halo (wide, soft)
+        lv_obj_t *g = lv_line_create(screen);
+        lv_line_set_points(g, pts, 2);
+        lv_obj_set_pos(g, cx, cy);
+        lv_obj_set_style_line_color(g, lv_color_hex(0xFF2EC6), 0);
+        lv_obj_set_style_line_width(g, 12, 0);
+        lv_obj_set_style_line_rounded(g, true, 0);
+        lv_obj_set_style_line_opa(g, 70, 0);
+        lv_obj_set_style_transform_pivot_x(g, 0, 0);
+        lv_obj_set_style_transform_pivot_y(g, 0, 0);
+        lv_obj_clear_flag(g, LV_OBJ_FLAG_CLICKABLE);
+        if (glowOut) *glowOut = g;
+        // sharp bright-pink line on top
+        lv_obj_t *ln = lv_line_create(screen);
+        lv_line_set_points(ln, pts, 2);
+        lv_obj_set_pos(ln, cx, cy);
+        lv_obj_set_style_line_color(ln, lv_color_hex(0xFF2EC6), 0);  // bright pink
+        lv_obj_set_style_line_width(ln, 4, 0);
+        lv_obj_set_style_line_rounded(ln, true, 0);
+        lv_obj_set_style_line_opa(ln, 255, 0);
+        lv_obj_set_style_transform_pivot_x(ln, 0, 0);
+        lv_obj_set_style_transform_pivot_y(ln, 0, 0);
+        lv_obj_clear_flag(ln, LV_OBJ_FLAG_CLICKABLE);
+        return ln;
+    };
+    radarEyeL = makeEye(radarEyeLPts, RADAR_LX, RADAR_LY, RADAR_ER, &radarEyeLGlow);
+    radarEyeR = makeEye(radarEyeRPts, RADAR_RX, RADAR_RY, RADAR_ER, &radarEyeRGlow);
+
+    // Cycling HUD readout between the eyes (sits over the baked text, stays live).
+    lv_obj_t *ctBox = lv_obj_create(screen);
+    lv_obj_remove_style_all(ctBox);
+    lv_obj_set_size(ctBox, 56, 96);
+    lv_obj_set_pos(ctBox, 174, 196);
+    lv_obj_set_style_bg_color(ctBox, lv_color_hex(0x02060A), 0);
+    lv_obj_set_style_bg_opa(ctBox, 150, 0);
+    lv_obj_set_style_radius(ctBox, 4, 0);
+    lv_obj_clear_flag(ctBox, (lv_obj_flag_t)(LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE));
+    radarCenterTxt = lv_label_create(ctBox);
+    lv_label_set_text(radarCenterTxt, "SCAN\n....\n....\n....");
+    lv_obj_set_style_text_font(radarCenterTxt, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(radarCenterTxt, lv_color_hex(0x8FFCE8), 0);
+    lv_obj_set_style_text_line_space(radarCenterTxt, 5, 0);
+    lv_obj_center(radarCenterTxt);
+
+    // Left scrim so the neon time/date stay readable over the busy art.
+    lv_obj_t *scrim = lv_obj_create(screen);
+    lv_obj_remove_style_all(scrim);
+    lv_obj_set_size(scrim, 78, 502);
+    lv_obj_set_pos(scrim, 0, 0);
+    lv_obj_set_style_bg_color(scrim, lv_color_hex(0x010204), 0);
+    lv_obj_set_style_bg_opa(scrim, 110, 0);
+    lv_obj_clear_flag(scrim, (lv_obj_flag_t)(LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE));
+
+    // Sideways 7-segment time: [HH] : [MM] in one row, rotated -90 as a unit.
+    radarVTime = lv_obj_create(screen);
+    lv_obj_remove_style_all(radarVTime);
+    lv_obj_set_flex_flow(radarVTime, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(radarVTime, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(radarVTime, 5, 0);
+    lv_obj_set_size(radarVTime, 152, 54);
+    lv_obj_clear_flag(radarVTime, (lv_obj_flag_t)(LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE));
+    lv_obj_set_style_transform_pivot_x(radarVTime, 76, 0);
+    lv_obj_set_style_transform_pivot_y(radarVTime, 27, 0);
+    lv_obj_set_style_transform_rotation(radarVTime, -900, 0);
+    lv_obj_align(radarVTime, LV_ALIGN_LEFT_MID, -46, 0);
+
+    const int DW = 30, DH = 54, T = 6, VL = (DH - 3 * T) / 2;
+    const int segGeo[7][4] = {
+        { T,       0,        DW - 2*T, T  },   // a top
+        { DW - T,  T,        T,        VL },   // b top-right
+        { DW - T,  2*T + VL, T,        VL },   // c bottom-right
+        { T,       DH - T,   DW - 2*T, T  },   // d bottom
+        { 0,       2*T + VL, T,        VL },   // e bottom-left
+        { 0,       T,        T,        VL },   // f top-left
+        { T,       T + VL,   DW - 2*T, T  },   // g middle
+    };
+    auto makeDigitCell = [&](int cell) {
+        lv_obj_t *dc = lv_obj_create(radarVTime);
+        lv_obj_remove_style_all(dc);
+        lv_obj_set_size(dc, DW, DH);
+        lv_obj_clear_flag(dc, (lv_obj_flag_t)(LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE));
+        for (int i = 0; i < 7; ++i) {
+            lv_obj_t *s = lv_obj_create(dc);
+            lv_obj_remove_style_all(s);
+            lv_obj_set_size(s, segGeo[i][2], segGeo[i][3]);
+            lv_obj_set_pos(s, segGeo[i][0], segGeo[i][1]);
+            lv_obj_set_style_radius(s, 2, 0);
+            lv_obj_set_style_bg_color(s, lv_color_hex(0x0B3D12), 0);
+            lv_obj_set_style_bg_opa(s, 90, 0);
+            lv_obj_set_style_shadow_color(s, lv_color_hex(RADAR_NEON), 0);
+            lv_obj_set_style_shadow_width(s, 8, 0);
+            lv_obj_set_style_shadow_opa(s, 0, 0);
+            lv_obj_clear_flag(s, (lv_obj_flag_t)(LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE));
+            radarSeg[cell][i] = s;
+        }
+    };
+    makeDigitCell(0);
+    makeDigitCell(1);
+    {   // colon between hours and minutes
+        lv_obj_t *cc = lv_obj_create(radarVTime);
+        lv_obj_remove_style_all(cc);
+        lv_obj_set_size(cc, 12, DH);
+        lv_obj_clear_flag(cc, (lv_obj_flag_t)(LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE));
+        for (int k = 0; k < 2; ++k) {
+            lv_obj_t *dot = lv_obj_create(cc);
+            lv_obj_remove_style_all(dot);
+            lv_obj_set_size(dot, 7, 7);
+            lv_obj_set_pos(dot, 2, (k == 0) ? 16 : 32);
+            lv_obj_set_style_radius(dot, 2, 0);
+            lv_obj_set_style_bg_color(dot, lv_color_hex(RADAR_NEON), 0);
+            lv_obj_set_style_bg_opa(dot, LV_OPA_COVER, 0);
+            lv_obj_clear_flag(dot, (lv_obj_flag_t)(LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE));
+        }
+    }
+    makeDigitCell(2);
+    makeDigitCell(3);
+
+    // Vertical day + date just inside the time, in neon green.
+    radarVMeta = lv_obj_create(screen);
+    lv_obj_remove_style_all(radarVMeta);
+    lv_obj_set_size(radarVMeta, 190, 22);
+    lv_obj_set_flex_flow(radarVMeta, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(radarVMeta, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(radarVMeta, 10, 0);
+    lv_obj_clear_flag(radarVMeta, (lv_obj_flag_t)(LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE));
+    lv_obj_set_style_transform_pivot_x(radarVMeta, 95, 0);
+    lv_obj_set_style_transform_pivot_y(radarVMeta, 11, 0);
+    lv_obj_set_style_transform_rotation(radarVMeta, -900, 0);
+    lv_obj_align(radarVMeta, LV_ALIGN_LEFT_MID, -27, 0);
+
+    radarMetaDay = lv_label_create(radarVMeta);
+    lv_label_set_text(radarMetaDay, "---");
+    lv_obj_set_style_text_font(radarMetaDay, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(radarMetaDay, lv_color_hex(RADAR_NEON), 0);
+    radarMetaDate = lv_label_create(radarVMeta);
+    lv_label_set_text(radarMetaDate, "---");
+    lv_obj_set_style_text_font(radarMetaDate, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(radarMetaDate, lv_color_hex(RADAR_NEON), 0);
+
+    createTopBar();
+    updateRadarClock();
+}
+
+// ===========================================================================
+// M33K Runner - a neon endless-runner game (Page::Game), launched from the dock.
+// Tap anywhere to jump neon shards; flying crew come in overhead (don't jump).
+// Pick one of four characters; high score is saved to NVS.
+// ===========================================================================
+static void gameShowPick(bool show)
+{
+    auto SH = [&](lv_obj_t *o) {
+        if (!o) return;
+        if (show) lv_obj_clear_flag(o, LV_OBJ_FLAG_HIDDEN);
+        else      lv_obj_add_flag(o, LV_OBJ_FLAG_HIDDEN);
+    };
+    SH(gamePickPanel); SH(gamePickTitle); SH(gamePickHint);
+    SH(gameModeBtn[0]); SH(gameModeBtn[1]);
+    for (int i = 0; i < 4; ++i) SH(gamePickBtn[i]);
+    if (show) {   // hide live wardrive entities behind the (slightly sheer) panel
+        if (driveCar) lv_obj_add_flag(driveCar, LV_OBJ_FLAG_HIDDEN);
+        if (driveHead) lv_obj_add_flag(driveHead, LV_OBJ_FLAG_HIDDEN);
+        if (driveBg)  lv_obj_add_flag(driveBg, LV_OBJ_FLAG_HIDDEN);
+        for (int i = 0; i < DRV_PICK; ++i) if (drvPick[i]) lv_obj_add_flag(drvPick[i], LV_OBJ_FLAG_HIDDEN);
+        for (int i = 0; i < DRV_ENE; ++i)  if (drvEne[i])  lv_obj_add_flag(drvEne[i],  LV_OBJ_FLAG_HIDDEN);
+    }
+    if (gameOverLbl) {
+        if (show && gameState == GameState::Dead) lv_obj_clear_flag(gameOverLbl, LV_OBJ_FLAG_HIDDEN);
+        else lv_obj_add_flag(gameOverLbl, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+// Switch between the two games on the pick screen.
+static void gameModeEvent(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED || !clickAllowed()) return;
+    gameMode = (int)(intptr_t)lv_event_get_user_data(e);
+    hapticTap();
+    for (int i = 0; i < 2; ++i) if (gameModeBtn[i]) {
+        bool on = (i == gameMode);
+        lv_obj_set_style_border_width(gameModeBtn[i], on ? 3 : 1, 0);
+        lv_obj_set_style_border_color(gameModeBtn[i], lv_color_hex(on ? 0x39FF14 : 0x214058), 0);
+        lv_obj_set_style_bg_color(gameModeBtn[i], lv_color_hex(on ? 0x113022 : 0x0A1726), 0);
+    }
+    if (gamePickHint)  lv_label_set_text(gamePickHint, gameMode
+        ? "PICK A CAR  -  HOLD TO STEER" : "TAP A CHARACTER TO PLAY");
+}
+
+static void gameStart(int idx)
+{
+    if (idx < 0 || idx > 3) idx = 0;
+    gameSel = idx; prefs.putInt("gameChar", idx);
+    const lv_image_dsc_t *sp = g_run0[idx];
+    gamePw = sp->header.w; gamePh = sp->header.h;
+    if (gamePlayer) {
+        lv_image_set_src(gamePlayer, sp);
+        lv_image_set_pivot(gamePlayer, (int)gamePw / 2, (int)gamePh / 2);
+        lv_image_set_rotation(gamePlayer, 0);
+    }
+    gamePy = GAME_GROUND_Y - gamePh; gameVy = 0; gameOnGround = true;
+    gameSpd = 280; gameDist = 0; gameSpawnIn = 0.8f; gameShake = 0; gameLastAir = false;
+    gameFrame = 0; gameAnimMs = millis();
+    for (int i = 0; i < GAME_OBS; ++i) {
+        gameObs[i].active = false;
+        if (gameObs[i].img) lv_obj_add_flag(gameObs[i].img, LV_OBJ_FLAG_HIDDEN);
+    }
+    for (int i = 0; i < GAME_BLAST; ++i) {
+        gameBlastActive[i] = false;
+        if (gameBlast[i]) { lv_image_set_src(gameBlast[i], g_blast[gameSel]); lv_obj_add_flag(gameBlast[i], LV_OBJ_FLAG_HIDDEN); }
+    }
+    for (int i = 0; i < GAME_POP; ++i) {
+        gamePopT[i] = -1.0f;
+        if (gamePop[i]) lv_obj_add_flag(gamePop[i], LV_OBJ_FLAG_HIDDEN);
+    }
+    for (int i = 0; i < GAME_EXPL; ++i) {
+        gameExplT[i] = -1.0f;
+        if (gameExpl[i]) lv_obj_add_flag(gameExpl[i], LV_OBJ_FLAG_HIDDEN);
+    }
+    gamePopNextMs = millis() + 400;
+    if (gamePlayer) {
+        lv_obj_set_pos(gamePlayer, 70, (int)gamePy);
+        lv_obj_clear_flag(gamePlayer, LV_OBJ_FLAG_HIDDEN);
+    }
+    gameState = GameState::Play;
+    gameShowPick(false);
+}
+
+static void gameDie()
+{
+    gameState = GameState::Dead; gameShake = 14;
+    if ((int)gameDist > gameBest) { gameBest = (int)gameDist; prefs.putInt("gameBest", gameBest); }
+    hapticTap(); sfxDie();
+    if (gameOverLbl) lv_label_set_text_fmt(gameOverLbl, "SCORE %d   BEST %d", (int)gameDist, gameBest);
+    if (gamePlayer) lv_obj_add_flag(gamePlayer, LV_OBJ_FLAG_HIDDEN);
+    for (int i = 0; i < GAME_OBS; ++i) {
+        gameObs[i].active = false;
+        if (gameObs[i].img) lv_obj_add_flag(gameObs[i].img, LV_OBJ_FLAG_HIDDEN);
+    }
+    for (int i = 0; i < GAME_BLAST; ++i) {
+        gameBlastActive[i] = false;
+        if (gameBlast[i]) lv_obj_add_flag(gameBlast[i], LV_OBJ_FLAG_HIDDEN);
+    }
+    gameShowPick(true);
+}
+
+// Fill one free obstacle slot at startX. forceType: -1 random, 0 ground spike,
+// 1 air bubble. Returns true if a slot was placed.
+static bool gameSpawnOne(float startX, int forceType)
+{
+    int slot = -1;
+    for (int i = 0; i < GAME_OBS; ++i) if (!gameObs[i].active) { slot = i; break; }
+    if (slot < 0 || !gameObs[slot].img) return false;
+    float airP = 0.24f + (gameSpd - 280.0f) / 620.0f; if (airP > 0.66f) airP = 0.66f;
+    bool air = (forceType == 0) ? false : (forceType == 1) ? true
+                 : (((rand() % 1000) / 1000.0f) < airP);
+    gameLastAir = air;
+    GameObs &o = gameObs[slot];
+    o.active = true; o.air = air; o.x = startX; o.bob = rand() % 60;
+    if (air) {
+        lv_image_set_src(o.img, g_flyers[rand() % 3]); o.w = 44; o.h = 44;
+    } else {
+        float tb = (gameSpd - 260.0f) / 720.0f; if (tb > 0.55f) tb = 0.55f;
+        bool tall = ((rand() % 1000) / 1000.0f) < tb;
+        lv_image_set_src(o.img, tall ? &g_shard_t : &g_shard_s);
+        o.w = tall ? 34 : 30; o.h = tall ? 52 : 34;
+    }
+    lv_obj_clear_flag(o.img, LV_OBJ_FLAG_HIDDEN);
+    return true;
+}
+
+static void gameSpawn()
+{
+    if (!gameSpawnOne(430.0f, -1)) return;
+    // As the run speeds up, often send a second obstacle right behind the first
+    // - the opposite kind, staggered - so you must clear a spike and a bubble
+    // close together (jump the spike, then float/shoot the bubble).
+    float pDouble = (gameSpd - 360.0f) / 760.0f;
+    if (pDouble < 0.0f) pDouble = 0.0f; if (pDouble > 0.55f) pDouble = 0.55f;
+    if (((rand() % 1000) / 1000.0f) < pDouble) {
+        int otherType = gameLastAir ? 0 : 1;                 // opposite of the first
+        gameSpawnOne(430.0f + 76.0f + (rand() % 66), otherType);
+    }
+}
+
+void gameJumpEvent(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    if (currentPage != Page::Game || gameState != GameState::Play || gameMode != 0) return;
+    if (gameOnGround) {
+        gameVy = -GAME_JUMP; gameOnGround = false; hapticTap(); sfxJump();
+    } else {
+        // In the air: a tap floats (flap) and fires a blast at the bubbles.
+        if (gameVy > -260.0f) gameVy = -GAME_FLAP;
+        for (int i = 0; i < GAME_BLAST; ++i) {
+            if (!gameBlastActive[i] && gameBlast[i]) {
+                gameBlastActive[i] = true;
+                gameBlastX[i] = 70 + gamePw;             // muzzle at the runner's front
+                gameBlastY[i] = gamePy + gamePh * 0.4f;
+                lv_obj_clear_flag(gameBlast[i], LV_OBJ_FLAG_HIDDEN);
+                break;
+            }
+        }
+        hapticTap(); sfxShoot();
+    }
+}
+
+void gamePickEvent(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED || !clickAllowed()) return;
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    noteActivity(); hapticTap();
+    if (gameMode == 1) driveStart(idx);
+    else               gameStart(idx);
+}
+
+void driveTick(float dt, uint32_t now);
+
+void gameTimerCb(lv_timer_t *timer)
+{
+    LV_UNUSED(timer);
+    if (currentPage != Page::Game || gameState != GameState::Play) return;
+    const uint32_t now = millis();
+    const float dt = 0.024f;
+    if (gameMode == 1) { driveTick(dt, now); return; }
+    gameDist += gameSpd * dt * 0.1f;
+    gameSpd  += dt * 22.0f; if (gameSpd > 900.0f) gameSpd = 900.0f;   // steeper ramp, higher cap
+    gameVy   += GAME_GRAV * dt; gamePy += gameVy * dt;
+    if (gamePy >= GAME_GROUND_Y - gamePh) { gamePy = GAME_GROUND_Y - gamePh; gameVy = 0; gameOnGround = true; }
+    int rot = gameOnGround ? 0 : (int)(gameVy * 0.18f);
+    if (rot > 250) rot = 250; if (rot < -250) rot = -250;
+    if (gamePlayer) { lv_obj_set_pos(gamePlayer, 70, (int)gamePy); lv_image_set_rotation(gamePlayer, rot); }
+
+    // Sprite frame: jump pose while airborne; run cycle (if any) on the ground.
+    if (gamePlayer) {
+        const lv_image_dsc_t *want;
+        if (!gameOnGround) want = g_jump[gameSel];
+        else if (g_run_anim[gameSel]) {
+            const uint32_t step = (gameSpd > 520) ? 90 : 130;
+            if (now - gameAnimMs > step) { gameAnimMs = now; gameFrame ^= 1; }
+            want = gameFrame ? g_run1[gameSel] : g_run0[gameSel];
+        } else want = g_run0[gameSel];
+        lv_image_set_src(gamePlayer, want);
+    }
+
+    // Parallax skyline drifts left and wraps.
+    for (int i = 0; i < GAME_BLD; ++i) {
+        if (!gameBld[i]) continue;
+        gameBldX[i] -= gameSpd * dt * 0.35f;
+        if (gameBldX[i] < -70.0f) gameBldX[i] += GAME_BLD * 64.0f;
+        lv_obj_set_x(gameBld[i], (int)gameBldX[i]);
+    }
+
+    // Wi-Fi / BLE signal bursts popping in the sky (expanding rings).
+    if (now >= gamePopNextMs) {
+        for (int i = 0; i < GAME_POP; ++i) {
+            if (gamePopT[i] < 0 && gamePop[i]) {
+                gamePopT[i] = 0; gamePopX[i] = 24 + rand() % 360; gamePopY[i] = 40 + rand() % 200;
+                lv_obj_set_style_border_color(gamePop[i], lv_color_hex((rand() & 1) ? 0x3AEFFF : 0xFF2EC6), 0);
+                lv_obj_clear_flag(gamePop[i], LV_OBJ_FLAG_HIDDEN);
+                break;
+            }
+        }
+        gamePopNextMs = now + 300 + rand() % 550;
+    }
+    for (int i = 0; i < GAME_POP; ++i) {
+        if (gamePopT[i] < 0 || !gamePop[i]) continue;
+        gamePopT[i] += dt / 0.5f;
+        if (gamePopT[i] >= 1.0f) { gamePopT[i] = -1.0f; lv_obj_add_flag(gamePop[i], LV_OBJ_FLAG_HIDDEN); continue; }
+        int sz = (int)(8 + gamePopT[i] * 44);
+        lv_obj_set_size(gamePop[i], sz, sz);
+        lv_obj_set_pos(gamePop[i], gamePopX[i] - sz / 2, gamePopY[i] - sz / 2);
+        lv_obj_set_style_border_opa(gamePop[i], (uint8_t)((1.0f - gamePopT[i]) * 220), 0);
+    }
+
+    // Explosions (white -> red -> black flash) when a bubble was popped.
+    for (int i = 0; i < GAME_EXPL; ++i) {
+        if (gameExplT[i] < 0 || !gameExpl[i]) continue;
+        gameExplT[i] += dt / 0.30f;
+        if (gameExplT[i] >= 1.0f) { gameExplT[i] = -1.0f; lv_obj_add_flag(gameExpl[i], LV_OBJ_FLAG_HIDDEN); continue; }
+        float t = gameExplT[i];
+        int sz = (int)(12 + t * 46);
+        lv_obj_set_size(gameExpl[i], sz, sz);
+        lv_obj_set_pos(gameExpl[i], gameExplX[i] - sz / 2, gameExplY[i] - sz / 2);
+        uint32_t col = (t < 0.30f) ? 0xFFFFFF : (t < 0.60f ? 0xFF2222 : 0x111111);
+        lv_obj_set_style_bg_color(gameExpl[i], lv_color_hex(col), 0);
+        lv_obj_set_style_bg_opa(gameExpl[i], (uint8_t)((1.0f - t) * 255), 0);
+    }
+
+    gameSpawnIn -= dt;
+    if (gameSpawnIn <= 0) {
+        gameSpawn();
+        float gap = 1.0f - gameSpd / 520.0f; if (gap < 0.30f) gap = 0.30f;
+        gameSpawnIn = gap + (rand() % 30) / 100.0f;
+    }
+
+    // 1) Move obstacles and record their y.
+    for (int i = 0; i < GAME_OBS; ++i) {
+        GameObs &o = gameObs[i];
+        if (!o.active || !o.img) continue;
+        o.x -= gameSpd * dt;
+        if (o.air) { o.bob++; o.oy = GAME_GROUND_Y - 120 + (int)(sinf(o.bob * 0.08f) * 7.0f); }
+        else o.oy = GAME_GROUND_Y - (int)o.h;
+        lv_obj_set_pos(o.img, (int)o.x, o.oy);
+        if (o.x + o.w < -12) { o.active = false; lv_obj_add_flag(o.img, LV_OBJ_FLAG_HIDDEN); }
+    }
+
+    // 2) Blasts fly right and pop flying bubbles.
+    for (int i = 0; i < GAME_BLAST; ++i) {
+        if (!gameBlastActive[i] || !gameBlast[i]) continue;
+        gameBlastX[i] += 820.0f * dt;
+        if (gameBlastX[i] > 420) { gameBlastActive[i] = false; lv_obj_add_flag(gameBlast[i], LV_OBJ_FLAG_HIDDEN); continue; }
+        lv_obj_set_pos(gameBlast[i], (int)gameBlastX[i], (int)gameBlastY[i]);
+        for (int j = 0; j < GAME_OBS; ++j) {
+            GameObs &o = gameObs[j];
+            if (!o.active || !o.air) continue;
+            if (gameBlastX[i] + 14 > o.x && gameBlastX[i] < o.x + o.w &&
+                gameBlastY[i] + 6 > o.oy && gameBlastY[i] < o.oy + o.h) {
+                o.active = false; lv_obj_add_flag(o.img, LV_OBJ_FLAG_HIDDEN);
+                gameBlastActive[i] = false; lv_obj_add_flag(gameBlast[i], LV_OBJ_FLAG_HIDDEN);
+                gameDist += 5;                      // bonus for popping a bubble
+                sfxPop();
+                for (int k = 0; k < GAME_EXPL; ++k) {
+                    if (gameExplT[k] < 0 && gameExpl[k]) {
+                        gameExplT[k] = 0.0f;
+                        gameExplX[k] = (int)(o.x + o.w / 2);
+                        gameExplY[k] = o.oy + (int)o.h / 2;
+                        lv_obj_clear_flag(gameExpl[k], LV_OBJ_FLAG_HIDDEN);
+                        break;
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    // 3) Player collision against remaining obstacles.
+    const int ax = 70 + 6, ay = (int)gamePy + 6, aw = (int)gamePw - 12, ah = (int)gamePh - 10;
+    for (int i = 0; i < GAME_OBS; ++i) {
+        GameObs &o = gameObs[i];
+        if (!o.active || !o.img) continue;
+        int ins = o.air ? 7 : 2;
+        int bx = (int)o.x + ins, by = o.oy + ins, bw = (int)o.w - 2 * ins, bh = (int)o.h - 2 * ins;
+        if (ax < bx + bw && ax + aw > bx && ay < by + bh && ay + ah > by) { gameDie(); return; }
+    }
+    if (gameScoreLbl) lv_label_set_text_fmt(gameScoreLbl, "%05d", (int)gameDist);
+}
+
+// ===========================================================================
+// M33K Wardrive - top-down driving game (second mode on the Game page).
+// Drive a character car around a dark grid, collect Wi-Fi / BLE signals, dodge
+// roaming malware. Hold a finger on the screen to steer the car toward it.
+// ===========================================================================
+static void buildDriveCar(int sel)
+{
+    uint32_t trim = DRV_TRIM[(sel >= 0 && sel < 4) ? sel : 0];
+    // Body (points "up" at rotation 0).
+    driveCar = lv_obj_create(screen);
+    lv_obj_remove_style_all(driveCar);
+    lv_obj_set_size(driveCar, 30, 50);
+    lv_obj_set_style_radius(driveCar, 9, 0);
+    lv_obj_set_style_bg_color(driveCar, lv_color_hex(0x121419), 0);
+    lv_obj_set_style_bg_opa(driveCar, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(driveCar, 2, 0);
+    lv_obj_set_style_border_color(driveCar, lv_color_hex(trim), 0);
+    lv_obj_set_style_shadow_color(driveCar, lv_color_hex(trim), 0);
+    lv_obj_set_style_shadow_width(driveCar, 12, 0);
+    lv_obj_set_style_shadow_opa(driveCar, 150, 0);
+    lv_obj_clear_flag(driveCar, (lv_obj_flag_t)(LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE));
+    lv_obj_set_style_transform_pivot_x(driveCar, 15, 0);
+    lv_obj_set_style_transform_pivot_y(driveCar, 25, 0);
+    // Windshield near the front.
+    lv_obj_t *ws = lv_obj_create(driveCar); lv_obj_remove_style_all(ws);
+    lv_obj_set_size(ws, 20, 12); lv_obj_set_pos(ws, 5, 7);
+    lv_obj_set_style_radius(ws, 4, 0);
+    lv_obj_set_style_bg_color(ws, lv_color_hex(trim), 0);
+    lv_obj_set_style_bg_opa(ws, 150, 0);
+    // Headlight dots.
+    for (int i = 0; i < 2; ++i) {
+        lv_obj_t *h = lv_obj_create(driveCar); lv_obj_remove_style_all(h);
+        lv_obj_set_size(h, 5, 5); lv_obj_set_pos(h, i ? 20 : 5, 2);
+        lv_obj_set_style_radius(h, LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_bg_color(h, lv_color_hex(0xFFFFFF), 0);
+    }
+    // Rear light bar.
+    lv_obj_t *rb = lv_obj_create(driveCar); lv_obj_remove_style_all(rb);
+    lv_obj_set_size(rb, 22, 4); lv_obj_set_pos(rb, 4, 43);
+    lv_obj_set_style_radius(rb, 2, 0);
+    lv_obj_set_style_bg_color(rb, lv_color_hex(0xFF3B3B), 0);
+    lv_obj_add_flag(driveCar, LV_OBJ_FLAG_HIDDEN);
+
+    // Character head rides upright on top of the car (separate object so it
+    // stays readable while the car body rotates to its heading).
+    driveHead = lv_image_create(screen);
+    lv_image_set_src(driveHead, g_carhead[(sel >= 0 && sel < 4) ? sel : 0]);
+    lv_obj_clear_flag(driveHead, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(driveHead, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void driveSpawnPick(int i)
+{
+    drvPickX[i] = 30 + rand() % 350;
+    drvPickY[i] = 74 + rand() % 392;
+    drvPickBle[i] = (rand() & 1);
+    if (drvPick[i]) {
+        uint32_t col = drvPickBle[i] ? 0x2A8BFF : 0x3AEFFF;
+        lv_label_set_text(drvPick[i], drvPickBle[i] ? LV_SYMBOL_BLUETOOTH : LV_SYMBOL_WIFI);
+        lv_obj_set_style_text_color(drvPick[i], lv_color_hex(col), 0);
+        lv_obj_set_style_shadow_color(drvPick[i], lv_color_hex(col), 0);
+        lv_obj_set_pos(drvPick[i], (int)drvPickX[i] - 11, (int)drvPickY[i] - 12);
+        lv_obj_clear_flag(drvPick[i], LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void drivePlaceEnemy(int i)
+{
+    // Spawn at a screen edge, away from the car.
+    int edge = rand() % 4;
+    if (edge == 0) { drvEneX[i] = rand() % 410; drvEneY[i] = -10; }
+    else if (edge == 1) { drvEneX[i] = rand() % 410; drvEneY[i] = 512; }
+    else if (edge == 2) { drvEneX[i] = -10; drvEneY[i] = rand() % 502; }
+    else { drvEneX[i] = 420; drvEneY[i] = rand() % 502; }
+    drvEneVx[i] = 0; drvEneVy[i] = 0; drvEneActive[i] = true;
+    if (drvEne[i]) lv_obj_clear_flag(drvEne[i], LV_OBJ_FLAG_HIDDEN);
+}
+
+void driveStart(int sel)
+{
+    if (sel < 0 || sel > 3) sel = 0;
+    gameSel = sel; prefs.putInt("gameChar", sel);
+    gameMode = 1;
+    // Hide runner-only actors; show the grid map.
+    if (gamePlayer) lv_obj_add_flag(gamePlayer, LV_OBJ_FLAG_HIDDEN);
+    for (int i = 0; i < GAME_OBS; ++i) { gameObs[i].active = false; if (gameObs[i].img) lv_obj_add_flag(gameObs[i].img, LV_OBJ_FLAG_HIDDEN); }
+    for (int i = 0; i < GAME_POP; ++i)   { gamePopT[i] = -1.0f; if (gamePop[i]) lv_obj_add_flag(gamePop[i], LV_OBJ_FLAG_HIDDEN); }
+    for (int i = 0; i < GAME_BLAST; ++i) { gameBlastActive[i] = false; if (gameBlast[i]) lv_obj_add_flag(gameBlast[i], LV_OBJ_FLAG_HIDDEN); }
+    for (int i = 0; i < GAME_EXPL; ++i)  { gameExplT[i] = -1.0f; if (gameExpl[i]) lv_obj_add_flag(gameExpl[i], LV_OBJ_FLAG_HIDDEN); }
+    if (driveBg) lv_obj_clear_flag(driveBg, LV_OBJ_FLAG_HIDDEN);
+
+    // Recolor the car and swap in the chosen character's head.
+    if (driveCar) {
+        uint32_t trim = DRV_TRIM[sel];
+        lv_obj_set_style_border_color(driveCar, lv_color_hex(trim), 0);
+        lv_obj_set_style_shadow_color(driveCar, lv_color_hex(trim), 0);
+    }
+    if (driveHead) {
+        lv_image_set_src(driveHead, g_carhead[sel]);
+        lv_obj_clear_flag(driveHead, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    carX = 205; carY = 380; carHeading = 0; carSpeed = 150;
+    carTargetX = 205; carTargetY = 150; carSteer = false;
+    driveScore = 0; driveSignals = 0; driveTime = 0; driveActiveEne = 2;
+    for (int i = 0; i < DRV_PICK; ++i) driveSpawnPick(i);
+    for (int i = 0; i < DRV_ENE; ++i) {
+        if (i < driveActiveEne) drivePlaceEnemy(i);
+        else { drvEneActive[i] = false; if (drvEne[i]) lv_obj_add_flag(drvEne[i], LV_OBJ_FLAG_HIDDEN); }
+    }
+    if (driveCar) {
+        lv_obj_set_pos(driveCar, (int)carX - 15, (int)carY - 25);
+        lv_obj_set_style_transform_rotation(driveCar, 0, 0);
+        lv_obj_clear_flag(driveCar, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (gameScoreLbl) lv_label_set_text(gameScoreLbl, "00000");
+    if (gameBestLbl)  lv_label_set_text_fmt(gameBestLbl, "BEST %05d", driveBest);
+    gameState = GameState::Play;
+    gameShowPick(false);
+    if (driveBg) lv_obj_clear_flag(driveBg, LV_OBJ_FLAG_HIDDEN);
+    if (driveCar) lv_obj_clear_flag(driveCar, LV_OBJ_FLAG_HIDDEN);
+}
+
+void driveDie()
+{
+    gameState = GameState::Dead;
+    if (driveScore > driveBest) { driveBest = driveScore; prefs.putInt("driveBest", driveBest); }
+    hapticTap(); sfxDie();
+    if (gameOverLbl) lv_label_set_text_fmt(gameOverLbl, "SIGNALS %d   BEST %d", driveScore, driveBest);
+    if (driveCar) lv_obj_add_flag(driveCar, LV_OBJ_FLAG_HIDDEN);
+    if (driveHead) lv_obj_add_flag(driveHead, LV_OBJ_FLAG_HIDDEN);
+    for (int i = 0; i < DRV_PICK; ++i) if (drvPick[i]) lv_obj_add_flag(drvPick[i], LV_OBJ_FLAG_HIDDEN);
+    for (int i = 0; i < DRV_ENE; ++i)  if (drvEne[i])  lv_obj_add_flag(drvEne[i], LV_OBJ_FLAG_HIDDEN);
+    gameShowPick(true);
+}
+
+// Touch anywhere while driving to steer the car toward that point.
+void driveInputEvent(lv_event_t *e)
+{
+    if (gameMode != 1 || currentPage != Page::Game || gameState != GameState::Play) return;
+    lv_event_code_t c = lv_event_get_code(e);
+    if (c == LV_EVENT_PRESSING || c == LV_EVENT_PRESSED) {
+        lv_indev_t *indev = lv_indev_active();
+        if (indev) {
+            lv_point_t p; lv_indev_get_point(indev, &p);
+            carTargetX = p.x; carTargetY = p.y; carSteer = true;
+        }
+    } else if (c == LV_EVENT_RELEASED || c == LV_EVENT_PRESS_LOST) {
+        carSteer = false;
+    }
+}
+
+void driveTick(float dt, uint32_t now)
+{
+    driveTime += dt;
+    carSpeed = 150.0f + driveTime * 2.0f; if (carSpeed > 275.0f) carSpeed = 275.0f;
+
+    // Steer toward the held finger (limited turn rate); otherwise go straight.
+    if (carSteer) {
+        float dx = carTargetX - carX, dy = carTargetY - carY;
+        if (dx * dx + dy * dy > 64.0f) {
+            float ta = atan2f(dx, -dy);          // 0 = pointing up
+            float d = ta - carHeading;
+            while (d >  3.14159265f) d -= 6.28318531f;
+            while (d < -3.14159265f) d += 6.28318531f;
+            float maxt = 3.4f * dt;
+            if (d >  maxt) d =  maxt;
+            if (d < -maxt) d = -maxt;
+            carHeading += d;
+        }
+    }
+    carX += sinf(carHeading) * carSpeed * dt;
+    carY += -cosf(carHeading) * carSpeed * dt;
+    if (carX < -16) carX += 442; if (carX > 426) carX -= 442;
+    if (carY < -16) carY += 534; if (carY > 518) carY -= 534;
+    if (driveCar) {
+        lv_obj_set_pos(driveCar, (int)carX - 15, (int)carY - 25);
+        lv_obj_set_style_transform_rotation(driveCar, (int)(carHeading * 572.9578f), 0);
+    }
+
+    // Keep the character head riding upright on top of the car.
+    if (driveHead) lv_obj_set_pos(driveHead, (int)carX - (g_carhead[gameSel]->header.w / 2),
+                                             (int)carY - (g_carhead[gameSel]->header.h / 2) - 4);
+
+    // Pickups: pulse the glow, and collect on contact.
+    float pulse = 0.5f + 0.5f * sinf(now * 0.008f);
+    for (int i = 0; i < DRV_PICK; ++i) {
+        if (!drvPick[i]) continue;
+        lv_obj_set_style_shadow_opa(drvPick[i], (uint8_t)(90 + pulse * 150), 0);
+        float dx = drvPickX[i] - carX, dy = drvPickY[i] - carY;
+        if (dx * dx + dy * dy < 22.0f * 22.0f) {
+            driveScore += drvPickBle[i] ? 15 : 10;
+            driveSignals++;
+            hapticTap(); sfxCollect();
+            driveSpawnPick(i);
+            // Every few signals, send in another malware (ramps difficulty).
+            if (driveActiveEne < DRV_ENE && (driveSignals % 3) == 0) {
+                drivePlaceEnemy(driveActiveEne);
+                driveActiveEne++;
+            }
+        }
+    }
+
+    // Malware: wander with mild homing toward the car; contact ends the run.
+    float emax = 72.0f + driveTime * 1.1f; if (emax > 165.0f) emax = 165.0f;
+    for (int i = 0; i < driveActiveEne; ++i) {
+        if (!drvEneActive[i]) continue;
+        float dx = carX - drvEneX[i], dy = carY - drvEneY[i];
+        float dl = sqrtf(dx * dx + dy * dy) + 0.01f;
+        drvEneVx[i] += (dx / dl) * 30.0f * dt + ((rand() % 100) - 50) / 50.0f * 10.0f * dt;
+        drvEneVy[i] += (dy / dl) * 30.0f * dt + ((rand() % 100) - 50) / 50.0f * 10.0f * dt;
+        float es = sqrtf(drvEneVx[i] * drvEneVx[i] + drvEneVy[i] * drvEneVy[i]);
+        if (es > emax) { drvEneVx[i] = drvEneVx[i] / es * emax; drvEneVy[i] = drvEneVy[i] / es * emax; }
+        drvEneX[i] += drvEneVx[i] * dt; drvEneY[i] += drvEneVy[i] * dt;
+        if (drvEneX[i] < -20) drvEneX[i] += 450; if (drvEneX[i] > 430) drvEneX[i] -= 450;
+        if (drvEneY[i] < -20) drvEneY[i] += 542; if (drvEneY[i] > 522) drvEneY[i] -= 542;
+        if (drvEne[i]) lv_obj_set_pos(drvEne[i], (int)drvEneX[i] - 15, (int)drvEneY[i] - 15);
+        if (dx * dx + dy * dy < 21.0f * 21.0f) { driveDie(); return; }
+    }
+
+    if (gameScoreLbl) lv_label_set_text_fmt(gameScoreLbl, "%05d", driveScore);
+}
+
+void showGamePage()
+{
+    clearScreen();
+    currentPage = Page::Game;
+    // Wardrive steers by dragging a finger; stop LVGL from drag-scrolling the
+    // whole screen while we do that.
+    lv_obj_clear_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
+
+    for (int i = 0; i < GAME_OBS; ++i) { gameObs[i].img = nullptr; gameObs[i].active = false; }
+    gameBg = gameGroundLine = gamePlayer = gameScoreLbl = gameBestLbl = nullptr;
+    gamePickPanel = gamePickTitle = gamePickHint = gameOverLbl = nullptr;
+    for (int i = 0; i < 4; ++i) gamePickBtn[i] = nullptr;
+    for (int i = 0; i < GAME_BLD; ++i) gameBld[i] = nullptr;
+    for (int i = 0; i < GAME_STAR; ++i) gameStar[i] = nullptr;
+    for (int i = 0; i < GAME_POP; ++i) { gamePop[i] = nullptr; gamePopT[i] = -1.0f; }
+    for (int i = 0; i < GAME_BLAST; ++i) { gameBlast[i] = nullptr; gameBlastActive[i] = false; }
+    for (int i = 0; i < GAME_EXPL; ++i) { gameExpl[i] = nullptr; gameExplT[i] = -1.0f; }
+    driveCar = driveBg = driveHead = nullptr;
+    for (int i = 0; i < DRV_PICK; ++i) drvPick[i] = nullptr;
+    for (int i = 0; i < DRV_ENE; ++i)  { drvEne[i] = nullptr; drvEneActive[i] = false; }
+    for (int i = 0; i < 2; ++i) gameModeBtn[i] = nullptr;
+    gameMode = 0;
+
+    gameBest  = prefs.getInt("gameBest", 0);
+    driveBest = prefs.getInt("driveBest", 0);
+    gameSel  = prefs.getInt("gameChar", 0); if (gameSel < 0 || gameSel > 3) gameSel = 0;
+
+    // Sky background.
+    gameBg = lv_obj_create(screen); lv_obj_remove_style_all(gameBg);
+    lv_obj_set_size(gameBg, 410, 502); lv_obj_set_pos(gameBg, 0, 0);
+    lv_obj_set_style_bg_color(gameBg, lv_color_hex(0x071327), 0);
+    lv_obj_set_style_bg_grad_color(gameBg, lv_color_hex(0x04060c), 0);
+    lv_obj_set_style_bg_grad_dir(gameBg, LV_GRAD_DIR_VER, 0);
+    lv_obj_set_style_bg_opa(gameBg, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(gameBg, (lv_obj_flag_t)(LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE));
+
+    // Ground.
+    lv_obj_t *gfill = lv_obj_create(screen); lv_obj_remove_style_all(gfill);
+    lv_obj_set_size(gfill, 410, 502 - GAME_GROUND_Y); lv_obj_set_pos(gfill, 0, GAME_GROUND_Y);
+    lv_obj_set_style_bg_color(gfill, lv_color_hex(0x07200c), 0); lv_obj_set_style_bg_opa(gfill, 160, 0);
+    lv_obj_clear_flag(gfill, (lv_obj_flag_t)(LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE));
+    gameGroundLine = lv_obj_create(screen); lv_obj_remove_style_all(gameGroundLine);
+    lv_obj_set_size(gameGroundLine, 410, 3); lv_obj_set_pos(gameGroundLine, 0, GAME_GROUND_Y);
+    lv_obj_set_style_bg_color(gameGroundLine, lv_color_hex(0x39FF14), 0);
+    lv_obj_set_style_bg_opa(gameGroundLine, 255, 0);
+    lv_obj_set_style_shadow_color(gameGroundLine, lv_color_hex(0x39FF14), 0);
+    lv_obj_set_style_shadow_width(gameGroundLine, 10, 0);
+    lv_obj_set_style_shadow_opa(gameGroundLine, 180, 0);
+    lv_obj_clear_flag(gameGroundLine, (lv_obj_flag_t)(LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE));
+
+    // Parallax skyline (behind the action) to fill the sky above the runner.
+    static const int bldH[GAME_BLD] = { 150, 96, 196, 120, 170, 104, 140 };
+    for (int i = 0; i < GAME_BLD; ++i) {
+        lv_obj_t *b = lv_obj_create(screen); lv_obj_remove_style_all(b);
+        lv_obj_set_size(b, 52, bldH[i]);
+        gameBldX[i] = i * 64.0f;
+        lv_obj_set_pos(b, (int)gameBldX[i], GAME_GROUND_Y - bldH[i]);
+        lv_obj_set_style_bg_color(b, lv_color_hex(0x0C2740), 0);
+        lv_obj_set_style_bg_opa(b, 150, 0);
+        lv_obj_set_style_border_width(b, 1, 0);
+        lv_obj_set_style_border_color(b, lv_color_hex(0x16405E), 0);
+        lv_obj_clear_flag(b, (lv_obj_flag_t)(LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE));
+        gameBld[i] = b;
+    }
+    static const uint16_t starX[GAME_STAR] = { 30, 90, 150, 212, 270, 330, 384, 60, 300 };
+    static const uint16_t starY[GAME_STAR] = { 42, 92, 56, 120, 70, 104, 50, 150, 176 };
+    for (int i = 0; i < GAME_STAR; ++i) {
+        lv_obj_t *s = lv_obj_create(screen); lv_obj_remove_style_all(s);
+        int sz = (i % 3 == 0) ? 4 : 3;
+        lv_obj_set_size(s, sz, sz); lv_obj_set_pos(s, starX[i], starY[i]);
+        lv_obj_set_style_radius(s, LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_bg_color(s, lv_color_hex(0x9FE8FF), 0);
+        lv_obj_set_style_bg_opa(s, 200, 0);
+        lv_obj_clear_flag(s, (lv_obj_flag_t)(LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE));
+        gameStar[i] = s;
+    }
+
+    // Wardrive grid map (covers the runner scenery when driving; hidden until
+    // the Wardrive mode starts).
+    driveBg = lv_obj_create(screen); lv_obj_remove_style_all(driveBg);
+    lv_obj_set_size(driveBg, 410, 502); lv_obj_set_pos(driveBg, 0, 0);
+    lv_obj_set_style_bg_color(driveBg, lv_color_hex(0x05080f), 0);
+    lv_obj_set_style_bg_grad_color(driveBg, lv_color_hex(0x0A0F1C), 0);
+    lv_obj_set_style_bg_grad_dir(driveBg, LV_GRAD_DIR_VER, 0);
+    lv_obj_set_style_bg_opa(driveBg, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(driveBg, (lv_obj_flag_t)(LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE));
+    for (int gx = 1; gx < 6; ++gx) {
+        lv_obj_t *v = lv_obj_create(driveBg); lv_obj_remove_style_all(v);
+        lv_obj_set_size(v, 1, 502); lv_obj_set_pos(v, gx * 68, 0);
+        lv_obj_set_style_bg_color(v, lv_color_hex(0x13304A), 0);
+        lv_obj_set_style_bg_opa(v, 120, 0);
+    }
+    for (int gy = 1; gy < 8; ++gy) {
+        lv_obj_t *h = lv_obj_create(driveBg); lv_obj_remove_style_all(h);
+        lv_obj_set_size(h, 410, 1); lv_obj_set_pos(h, 0, gy * 64);
+        lv_obj_set_style_bg_color(h, lv_color_hex(0x13304A), 0);
+        lv_obj_set_style_bg_opa(h, 120, 0);
+    }
+    lv_obj_add_flag(driveBg, LV_OBJ_FLAG_HIDDEN);
+
+    // Wardrive pickups - real Wi-Fi / Bluetooth icons to catch.
+    for (int i = 0; i < DRV_PICK; ++i) {
+        lv_obj_t *p = lv_label_create(screen);
+        lv_label_set_text(p, LV_SYMBOL_WIFI);
+        lv_obj_set_style_text_font(p, &lv_font_montserrat_22, 0);
+        lv_obj_set_style_text_color(p, lv_color_hex(0x3AEFFF), 0);
+        lv_obj_set_style_shadow_color(p, lv_color_hex(0x3AEFFF), 0);
+        lv_obj_set_style_shadow_width(p, 12, 0);
+        lv_obj_set_style_shadow_opa(p, 180, 0);
+        lv_obj_add_flag(p, LV_OBJ_FLAG_HIDDEN);
+        drvPick[i] = p;
+    }
+    // Malware enemies - the spiky mine sprite.
+    for (int i = 0; i < DRV_ENE; ++i) {
+        lv_obj_t *en = lv_image_create(screen);
+        lv_image_set_src(en, &g_malware);
+        lv_obj_add_flag(en, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(en, LV_OBJ_FLAG_CLICKABLE);
+        drvEne[i] = en;
+    }
+
+    // Signal-burst ring pool (Wi-Fi/BLE pops in the sky).
+    for (int i = 0; i < GAME_POP; ++i) {
+        lv_obj_t *p = lv_obj_create(screen); lv_obj_remove_style_all(p);
+        lv_obj_set_size(p, 8, 8);
+        lv_obj_set_style_radius(p, LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_bg_opa(p, 0, 0);
+        lv_obj_set_style_border_width(p, 3, 0);
+        lv_obj_set_style_border_color(p, lv_color_hex(0x3AEFFF), 0);
+        lv_obj_add_flag(p, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(p, (lv_obj_flag_t)(LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE));
+        gamePop[i] = p;
+    }
+    // Blast pool (fired while airborne) - per-character projectile sprite.
+    for (int i = 0; i < GAME_BLAST; ++i) {
+        lv_obj_t *bz = lv_image_create(screen);
+        lv_image_set_src(bz, g_blast[gameSel]);
+        lv_obj_add_flag(bz, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(bz, LV_OBJ_FLAG_CLICKABLE);
+        gameBlast[i] = bz;
+    }
+    // Explosion pool (red/white/black flash on a popped bubble).
+    for (int i = 0; i < GAME_EXPL; ++i) {
+        lv_obj_t *x = lv_obj_create(screen); lv_obj_remove_style_all(x);
+        lv_obj_set_size(x, 12, 12);
+        lv_obj_set_style_radius(x, LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_bg_color(x, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_set_style_bg_opa(x, 0, 0);
+        lv_obj_set_style_border_width(x, 2, 0);
+        lv_obj_set_style_border_color(x, lv_color_hex(0x111111), 0);
+        lv_obj_add_flag(x, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(x, (lv_obj_flag_t)(LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE));
+        gameExpl[i] = x;
+    }
+
+    // Obstacle pool.
+    for (int i = 0; i < GAME_OBS; ++i) {
+        lv_obj_t *im = lv_image_create(screen);
+        lv_image_set_src(im, &g_shard_s);
+        lv_obj_add_flag(im, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(im, LV_OBJ_FLAG_CLICKABLE);
+        gameObs[i].img = im; gameObs[i].active = false;
+    }
+
+    // Player.
+    gamePlayer = lv_image_create(screen);
+    lv_image_set_src(gamePlayer, g_run0[gameSel]);
+    lv_obj_add_flag(gamePlayer, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(gamePlayer, LV_OBJ_FLAG_CLICKABLE);
+
+    // Wardrive car (built hidden; shown when Wardrive mode starts).
+    buildDriveCar(gameSel);
+
+    // Score + best.
+    gameScoreLbl = lv_label_create(screen); lv_label_set_text(gameScoreLbl, "00000");
+    lv_obj_set_style_text_font(gameScoreLbl, &lv_font_montserrat_22, 0);
+    lv_obj_set_style_text_color(gameScoreLbl, lv_color_hex(0x3AEFFF), 0);
+    lv_obj_align(gameScoreLbl, LV_ALIGN_TOP_MID, 0, 16);
+    gameBestLbl = lv_label_create(screen); lv_label_set_text_fmt(gameBestLbl, "BEST %05d", gameBest);
+    lv_obj_set_style_text_font(gameBestLbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(gameBestLbl, lv_color_hex(0x6F86A6), 0);
+    lv_obj_align(gameBestLbl, LV_ALIGN_TOP_MID, 0, 44);
+
+    // Full-screen transparent jump button (under the pick UI / back button).
+    lv_obj_t *jb = lv_button_create(screen); lv_obj_remove_style_all(jb);
+    lv_obj_set_size(jb, 410, 502); lv_obj_set_pos(jb, 0, 0);
+    lv_obj_clear_flag(jb, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(jb, gameJumpEvent, LV_EVENT_CLICKED, nullptr);
+    lv_obj_add_event_cb(jb, driveInputEvent, LV_EVENT_PRESSED, nullptr);
+    lv_obj_add_event_cb(jb, driveInputEvent, LV_EVENT_PRESSING, nullptr);
+    lv_obj_add_event_cb(jb, driveInputEvent, LV_EVENT_RELEASED, nullptr);
+    lv_obj_add_event_cb(jb, driveInputEvent, LV_EVENT_PRESS_LOST, nullptr);
+
+    // Pick / game-over overlay.
+    gamePickPanel = lv_obj_create(screen); lv_obj_remove_style_all(gamePickPanel);
+    lv_obj_set_size(gamePickPanel, 410, 502); lv_obj_set_pos(gamePickPanel, 0, 0);
+    lv_obj_set_style_bg_color(gamePickPanel, lv_color_hex(0x04080e), 0);
+    lv_obj_set_style_bg_opa(gamePickPanel, 210, 0);
+    lv_obj_clear_flag(gamePickPanel, (lv_obj_flag_t)(LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE));
+    gamePickTitle = lv_label_create(screen); lv_label_set_text(gamePickTitle, "M33K ARCADE");
+    lv_obj_set_style_text_font(gamePickTitle, &lv_font_montserrat_28, 0);
+    lv_obj_set_style_text_color(gamePickTitle, lv_color_hex(0x3AEFFF), 0);
+    lv_obj_align(gamePickTitle, LV_ALIGN_TOP_MID, 0, 70);
+    gameOverLbl = lv_label_create(screen); lv_label_set_text(gameOverLbl, "");
+    lv_obj_set_style_text_font(gameOverLbl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(gameOverLbl, lv_color_hex(0xDCECFF), 0);
+    lv_obj_align(gameOverLbl, LV_ALIGN_TOP_MID, 0, 116);
+    gamePickHint = lv_label_create(screen); lv_label_set_text(gamePickHint, "TAP A CHARACTER TO PLAY");
+    lv_obj_set_style_text_font(gamePickHint, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(gamePickHint, lv_color_hex(0x39FF14), 0);
+    lv_obj_align(gamePickHint, LV_ALIGN_TOP_MID, 0, 150);
+
+    // Four character buttons.
+    const int cx4[4] = { 54, 152, 256, 356 };
+    const char *nm4[4] = { "M33K", "GRUMPY", "MONKIE", "KITTIE" };
+    for (int i = 0; i < 4; ++i) {
+        lv_obj_t *b = lv_button_create(screen);
+        lv_obj_set_size(b, 86, 160); lv_obj_set_pos(b, cx4[i] - 43, 210);
+        lv_obj_set_style_radius(b, 14, 0);
+        lv_obj_set_style_bg_color(b, lv_color_hex(0x0A1726), 0);
+        lv_obj_set_style_bg_opa(b, 220, 0);
+        lv_obj_set_style_border_width(b, i == gameSel ? 3 : 1, 0);
+        lv_obj_set_style_border_color(b, lv_color_hex(i == gameSel ? 0x39FF14 : 0x214058), 0);
+        lv_obj_add_event_cb(b, gamePickEvent, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+        lv_obj_t *im = lv_image_create(b);
+        const lv_image_dsc_t *dsc = g_pick[i];   // hero portrait, not the run frame
+        lv_image_set_src(im, dsc);
+        lv_image_set_pivot(im, dsc->header.w / 2, dsc->header.h / 2);
+        lv_image_set_scale(im, 300);          // portraits are 64 px tall -> ~75 px
+        lv_obj_align(im, LV_ALIGN_TOP_MID, 0, 36);
+        lv_obj_clear_flag(im, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_t *l = lv_label_create(b); lv_label_set_text(l, nm4[i]);
+        lv_obj_set_style_text_font(l, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(l, lv_color_hex(i == gameSel ? 0x39FF14 : 0x9FB6CC), 0);
+        lv_obj_align(l, LV_ALIGN_BOTTOM_MID, 0, -8);
+        gamePickBtn[i] = b;
+    }
+
+    // Game-mode toggle (Runner / Wardrive), above the character row.
+    const char *mnm[2] = { "RUNNER", "WARDRIVE" };
+    const int mx[2] = { 58, 212 };
+    for (int i = 0; i < 2; ++i) {
+        lv_obj_t *mb = lv_button_create(screen);
+        lv_obj_set_size(mb, 140, 30); lv_obj_set_pos(mb, mx[i], 176);
+        lv_obj_set_style_radius(mb, 8, 0);
+        bool on = (i == gameMode);
+        lv_obj_set_style_bg_color(mb, lv_color_hex(on ? 0x113022 : 0x0A1726), 0);
+        lv_obj_set_style_bg_opa(mb, 230, 0);
+        lv_obj_set_style_border_width(mb, on ? 3 : 1, 0);
+        lv_obj_set_style_border_color(mb, lv_color_hex(on ? 0x39FF14 : 0x214058), 0);
+        lv_obj_add_event_cb(mb, gameModeEvent, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+        lv_obj_t *ml = lv_label_create(mb); lv_label_set_text(ml, mnm[i]);
+        lv_obj_set_style_text_font(ml, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(ml, lv_color_hex(0xDCECFF), 0);
+        lv_obj_center(ml);
+        gameModeBtn[i] = mb;
+    }
+
+    // Back button (top-left, above everything so it always works).
+    lv_obj_t *back = lv_button_create(screen);
+    lv_obj_set_size(back, 50, 44); lv_obj_set_pos(back, 26, 20);   // in from the corner
+    lv_obj_set_style_radius(back, 12, 0);
+    lv_obj_set_style_bg_color(back, lv_color_hex(0x10091D), 0);
+    lv_obj_set_style_border_width(back, 1, 0);
+    lv_obj_set_style_border_color(back, lv_color_hex(0xB37BFF), 0);
+    lv_obj_add_event_cb(back, backEvent, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t *bl = lv_label_create(back); lv_label_set_text(bl, LV_SYMBOL_LEFT);
+    lv_obj_set_style_text_color(bl, lv_color_hex(0xD9C2FF), 0); lv_obj_center(bl);
+
+    gameState = GameState::Pick;
+    gameShowPick(true);
+    gameAudioBegin();                 // power the speaker for arcade SFX
+    gameTimer = lv_timer_create(gameTimerCb, 24, nullptr);
+    noteActivity();
+    Serial.println("[M33K] Game open");
+}
+
+// Called from clearPageTimers() on every page teardown (after gameTimer is
+// deleted and before the screen's objects are freed): reset state + pointers.
+void stopGameTool()
+{
+    gameAudioEnd();                   // release the speaker when leaving the game
+    gameState = GameState::Pick;
+    for (int i = 0; i < GAME_OBS; ++i) { gameObs[i].img = nullptr; gameObs[i].active = false; }
+    gameBg = gameGroundLine = gamePlayer = gameScoreLbl = gameBestLbl = nullptr;
+    gamePickPanel = gamePickTitle = gamePickHint = gameOverLbl = nullptr;
+    for (int i = 0; i < 4; ++i) gamePickBtn[i] = nullptr;
+    for (int i = 0; i < GAME_BLD; ++i) gameBld[i] = nullptr;
+    for (int i = 0; i < GAME_STAR; ++i) gameStar[i] = nullptr;
+    for (int i = 0; i < GAME_POP; ++i) { gamePop[i] = nullptr; gamePopT[i] = -1.0f; }
+    for (int i = 0; i < GAME_BLAST; ++i) { gameBlast[i] = nullptr; gameBlastActive[i] = false; }
+    for (int i = 0; i < GAME_EXPL; ++i) { gameExpl[i] = nullptr; gameExplT[i] = -1.0f; }
+    driveCar = driveBg = driveHead = nullptr;
+    for (int i = 0; i < DRV_PICK; ++i) drvPick[i] = nullptr;
+    for (int i = 0; i < DRV_ENE; ++i)  { drvEne[i] = nullptr; drvEneActive[i] = false; }
+    for (int i = 0; i < 2; ++i) gameModeBtn[i] = nullptr;
+}
+
+// Place a bubble: random x, a drift speed and a gentle sway. On the initial
+// build they are scattered up the screen; afterwards they respawn below it.
+void bubbleRespawn(int i, bool initial)
+{
+    BubbleEntity &b = gBubbles[i];
+    const int span = 410 - b.size - 16;
+    b.x       = 8 + (span > 0 ? (rand() % span) : 0);
+    b.y       = initial ? (float)(rand() % 502) : 502.0f + (rand() % 160);
+    // Per-tick speeds scaled for the 33 ms tick (same on-screen px/sec as the
+    // old 50 ms tick, just smaller, smoother steps). Bigger bubbles drift
+    // slower (parallax).
+    b.speed   = 2.5f - (float)(b.size - 88) / 32.0f * 0.86f + (rand() % 30) / 150.0f;
+    if (b.speed < 1.2f) b.speed = 1.2f;
+    b.phase   = (rand() % 628) / 100.0f;
+    b.swayAmp = 2.5f + (rand() % 4);   // gentle side drift
+    if (b.obj) lv_obj_set_pos(b.obj, (int)b.x, (int)b.y);
+}
+
+void buildBubblesFace()
+{
+    srand(millis());
+
+    lv_obj_t *bg = lv_obj_create(screen);
+    lv_obj_remove_style_all(bg);
+    lv_obj_set_size(bg, 410, 502);
+    lv_obj_set_pos(bg, 0, 0);
+    lv_obj_set_style_bg_color(bg, lv_color_hex(0x070612), 0);
+    lv_obj_set_style_bg_grad_color(bg, lv_color_hex(0x16092A), 0);
+    lv_obj_set_style_bg_grad_dir(bg, LV_GRAD_DIR_VER, 0);
+    lv_obj_set_style_bg_opa(bg, LV_OPA_COVER, 0);
+
+    const uint32_t ringCols[4] = { 0x3AEFFF, 0xFF52C8, 0x9D7BFF, 0x45FF8C };
+
+    // Background layer: small faint bubbles that fall and wrap at the top.
+    for (int i = 0; i < BG_BUBBLE_COUNT; ++i) {
+        BubbleEntity &b = gBgBubbles[i];
+        const int sz  = 7 + (i * 11) % 16;     // ~7..22 px
+        const uint32_t col = ringCols[i % 4];
+        b.size    = sz;
+        b.x       = rand() % 410;
+        b.y       = rand() % 502;
+        b.speed   = 3.2f + (rand() % 100) / 55.0f;    // a bit faster, still gentle
+        b.phase   = (rand() % 628) / 100.0f;
+        b.swayAmp = 2.0f + (rand() % 5);
+
+        lv_obj_t *d = lv_obj_create(screen);
+        lv_obj_remove_style_all(d);
+        lv_obj_set_size(d, sz, sz);
+        lv_obj_set_style_radius(d, LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_bg_color(d, lv_color_hex(col), 0);
+        lv_obj_set_style_bg_opa(d, 40, 0);
+        lv_obj_set_style_border_width(d, 1, 0);
+        lv_obj_set_style_border_color(d, lv_color_hex(col), 0);
+        lv_obj_set_style_border_opa(d, 120, 0);
+        lv_obj_clear_flag(d, (lv_obj_flag_t)(LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE));
+        lv_obj_set_pos(d, (int)b.x, (int)b.y);
+        b.obj = d;
+    }
+
+    // Character layer: portraits float up in neon-ringed bubbles. Per-bubble
+    // size matches the stored image size (no runtime scaling).
+    //                            kA   kB   mon  t3ch grmp
+    static const int bSize[5] = { 88, 100,  92, 106, 110 };
+
+    for (int i = 0; i < BUBBLE_COUNT; ++i) {
+        BubbleEntity &b = gBubbles[i];
+        const int sz = (i < 5) ? bSize[i] : 100;
+        const uint32_t ring = ringCols[i % 4];
+        b.size = sz;
+        b.glowL = b.glowR = nullptr;
+
+        lv_obj_t *bub = lv_obj_create(screen);
+        lv_obj_remove_style_all(bub);
+        lv_obj_set_size(bub, sz, sz);
+        lv_obj_set_style_radius(bub, LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_clip_corner(bub, true, 0);
+        lv_obj_set_style_border_width(bub, 3, 0);
+        lv_obj_set_style_border_color(bub, lv_color_hex(ring), 0);
+        lv_obj_set_style_border_opa(bub, 210, 0);
+        // Neon glow halo around the ring. Kept small so the ~30 fps motion
+        // stays smooth (a wide blurred shadow is expensive to redraw each frame).
+        lv_obj_set_style_shadow_width(bub, 8, 0);
+        lv_obj_set_style_shadow_spread(bub, 0, 0);
+        lv_obj_set_style_shadow_color(bub, lv_color_hex(ring), 0);
+        lv_obj_set_style_shadow_opa(bub, 160, 0);
+        lv_obj_set_style_bg_color(bub, lv_color_hex(0x05040C), 0);
+        lv_obj_set_style_bg_opa(bub, LV_OPA_COVER, 0);
+        lv_obj_clear_flag(bub, (lv_obj_flag_t)(LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE));
+
+        lv_obj_t *img = lv_image_create(bub);
+        lv_image_set_src(img, m33k_bubble_imgs[i % m33k_bubble_img_count]);
+        lv_obj_center(img);
+        lv_obj_clear_flag(img, LV_OBJ_FLAG_CLICKABLE);
+
+        // Glossy highlight dot in the upper-left for a bubble look.
+        lv_obj_t *sh = lv_obj_create(bub);
+        lv_obj_remove_style_all(sh);
+        const int shd = sz / 5;
+        lv_obj_set_size(sh, shd, shd);
+        lv_obj_set_style_radius(sh, LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_bg_color(sh, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_set_style_bg_opa(sh, 130, 0);
+        lv_obj_align(sh, LV_ALIGN_TOP_LEFT, sz / 6, sz / 6);
+        lv_obj_clear_flag(sh, (lv_obj_flag_t)(LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE));
+
+        b.obj = bub;
+        bubbleRespawn(i, true);
+    }
+
+    createTopBar();
+    buildFaceClock(205);   // clock + date centered on this face
+}
+
+// ---------------------------------------------------------------------------
+// Weather face helpers
+// ---------------------------------------------------------------------------
+
+// Pull the first number that follows "key": in a JSON blob. Skips an optional
+// '[' so it also reads the first element of an array (daily min/max).
+static float weatherJsonNum(const String &s, const char *key)
+{
+    // Open-Meteo lists each field twice: once in a *_units object with a string
+    // value (e.g. "temperature_2m":"°F") and once with the real number.
+    // Skip the string (units) match and return the first numeric one.
+    String k = String("\"") + key + "\":";
+    int from = 0;
+    while (true) {
+        int i = s.indexOf(k, from);
+        if (i < 0) return 0.0f;
+        int j = i + k.length();
+        while (j < (int)s.length() && (s[j] == ' ' || s[j] == '[')) ++j;
+        if (j < (int)s.length() && s[j] == '"') { from = j + 1; continue; }  // units string
+        return s.substring(j, j + 16).toFloat();
+    }
+}
+
+static String weatherJsonStr(const String &s, const char *key)
+{
+    String k = String("\"") + key + "\":\"";
+    int i = s.indexOf(k);
+    if (i < 0) return "";
+    i += k.length();
+    int j = s.indexOf('"', i);
+    if (j < 0) return "";
+    return s.substring(i, j);
+}
+
+// WMO weather-code -> short label.
+static const char *weatherCondText(int code)
+{
+    if (code == 0) return "CLEAR";
+    if (code == 1 || code == 2) return "PARTLY CLOUDY";
+    if (code == 3) return "CLOUDY";
+    if (code == 45 || code == 48) return "FOG";
+    if (code >= 51 && code <= 57) return "DRIZZLE";
+    if (code >= 61 && code <= 67) return "RAIN";
+    if (code >= 71 && code <= 77) return "SNOW";
+    if (code >= 80 && code <= 82) return "SHOWERS";
+    if (code >= 85 && code <= 86) return "SNOW SHOWERS";
+    if (code >= 95) return "THUNDERSTORM";
+    return "--";
+}
+
+static uint32_t weatherCondColor(int code)
+{
+    if (code == 0) return 0xFFD23A;                 // clear - yellow
+    if (code >= 1 && code <= 3) return 0xCFE8FF;     // cloudy - pale blue
+    if (code == 45 || code == 48) return 0x9FB4C8;   // fog - grey
+    if (code >= 51 && code <= 67) return 0x3AEFFF;    // rain - cyan
+    if (code >= 71 && code <= 86) return 0xFFFFFF;    // snow - white
+    if (code >= 95) return 0xB388FF;                  // storm - violet
+    return 0xCFE8FF;
+}
+
+// Persist the last reading so it survives a reboot / power-off.
+void saveWeatherCache()
+{
+    prefs.putInt("wxT",  (int)lroundf(weatherTempF));
+    prefs.putInt("wxHi", (int)lroundf(weatherHiF));
+    prefs.putInt("wxLo", (int)lroundf(weatherLoF));
+    prefs.putInt("wxCode", weatherCode);
+    prefs.putInt("wxWind", (int)lroundf(weatherWindMph));
+    prefs.putString("wxPlace", weatherPlace);
+    prefs.putString("wxUpd", weatherUpdatedStr);
+}
+
+void loadWeatherCache()
+{
+    if (!prefs.isKey("wxUpd")) return;           // nothing saved yet
+    weatherTempF = prefs.getInt("wxT", 0);
+    weatherHiF   = prefs.getInt("wxHi", 0);
+    weatherLoF   = prefs.getInt("wxLo", 0);
+    weatherCode  = prefs.getInt("wxCode", -1);
+    weatherWindMph = prefs.getInt("wxWind", 0);
+    weatherPlace = prefs.getString("wxPlace", "");
+    weatherUpdatedStr = prefs.getString("wxUpd", "");
+    weatherHaveData = true;
+}
+
+// Show current data (from a fresh fetch or the saved cache) plus a status line.
+void applyWeatherToUi()
+{
+    if (weatherHaveData) {
+        if (weatherTempLabel)
+            lv_label_set_text_fmt(weatherTempLabel, "%d\xC2\xB0", (int)lroundf(weatherTempF));
+        if (weatherCondLabel) {
+            lv_label_set_text(weatherCondLabel, weatherCondText(weatherCode));
+            lv_obj_set_style_text_color(weatherCondLabel,
+                                        lv_color_hex(weatherCondColor(weatherCode)), 0);
+        }
+        if (weatherHiLoLabel)
+            lv_label_set_text_fmt(weatherHiLoLabel, "H %d\xC2\xB0   L %d\xC2\xB0",
+                                  (int)lroundf(weatherHiF), (int)lroundf(weatherLoF));
+        if (weatherPlaceLabel)
+            lv_label_set_text(weatherPlaceLabel,
+                              weatherPlace.length() ? weatherPlace.c_str() : "");
+    }
+    if (weatherStatusLabel && weatherHaveData) {
+        if (weatherState == WeatherState::Ready)
+            lv_label_set_text_fmt(weatherStatusLabel, "Updated %s", weatherUpdatedStr.c_str());
+        else if (weatherState == WeatherState::NoWifi || weatherState == WeatherState::Error)
+            lv_label_set_text_fmt(weatherStatusLabel, "Offline - last update %s",
+                                  weatherUpdatedStr.c_str());
+        else   // Idle with cached data (cold boot), before the first fetch
+            lv_label_set_text_fmt(weatherStatusLabel, "Last update %s",
+                                  weatherUpdatedStr.c_str());
+    }
+}
+
+// Blocking weather fetch. Serviced from the main loop (never from an LVGL
+// timer) so a slow network call cannot stall the LVGL task callbacks.
+void doWeatherFetch()
+{
+    weatherState = WeatherState::Updating;
+    if (weatherStatusLabel) lv_label_set_text(weatherStatusLabel, "Updating weather...");
+    Serial.printf("[M33K WX] fetch start | wifi=%d ssidLen=%d heap=%u\n",
+                  (int)WiFi.status(), (int)savedWifiSsid.length(),
+                  (unsigned)ESP.getFreeHeap());
+
+    // 1) Ensure Wi-Fi is up (reuses the saved credentials, same as NTP sync).
+    if (WiFi.status() != WL_CONNECTED) {
+        if (savedWifiSsid.length() == 0) {
+            weatherState = WeatherState::NoWifi;
+            if (weatherHaveData) applyWeatherToUi();
+            else if (weatherStatusLabel)
+                lv_label_set_text(weatherStatusLabel, "Set Wi-Fi in Settings for weather");
+            Serial.println("[M33K WX] no saved Wi-Fi credentials");
+            return;
+        }
+        WiFi.mode(WIFI_STA);
+        WiFi.begin(savedWifiSsid.c_str(), savedWifiPassword.c_str());
+        uint32_t t0 = millis();
+        while (WiFi.status() != WL_CONNECTED && millis() - t0 < 6000) {
+            instance.loop();
+            lv_timer_handler();
+            delay(40);
+        }
+        if (WiFi.status() != WL_CONNECTED) {
+            // Stop the background retry so WiFi isn't left perpetually
+            // "connecting" (which spams the log and breaks the Settings scan).
+            WiFi.setAutoReconnect(false);
+            WiFi.disconnect(false, false);
+            weatherState = WeatherState::NoWifi;
+            if (weatherHaveData) applyWeatherToUi();   // keep showing cached reading
+            else if (weatherStatusLabel)
+                lv_label_set_text(weatherStatusLabel, "Offline - no Wi-Fi");
+            Serial.printf("[M33K WX] wifi connect failed (status=%d)\n", (int)WiFi.status());
+            return;
+        }
+        Serial.println("[M33K WX] wifi connected");
+    }
+
+    // 2) Location: GPS fix if we have a recent one, else runtime IP lookup.
+    //    No coordinates are ever stored in source - this keeps the public repo
+    //    free of any location data.
+    double lat = 0, lon = 0;
+    bool haveLoc = false;
+    String place = "";
+    if (gpsParser.location.isValid() && gpsParser.location.age() < 120000UL) {
+        lat = gpsParser.location.lat();
+        lon = gpsParser.location.lng();
+        haveLoc = true;
+    } else {
+        HTTPClient http;
+        http.setConnectTimeout(5000);
+        http.setTimeout(5000);
+        if (http.begin("http://ip-api.com/json/?fields=status,lat,lon,city")) {
+            if (http.GET() == 200) {
+                String p = http.getString();
+                lat = weatherJsonNum(p, "lat");
+                lon = weatherJsonNum(p, "lon");
+                place = weatherJsonStr(p, "city");
+                haveLoc = (lat != 0.0 || lon != 0.0);
+            }
+            http.end();
+        }
+    }
+    if (!haveLoc) {
+        weatherState = WeatherState::Error;
+        if (weatherHaveData) applyWeatherToUi();
+        else if (weatherStatusLabel) lv_label_set_text(weatherStatusLabel, "Couldn't get location");
+        Serial.println("[M33K WX] location lookup failed");
+        return;
+    }
+    Serial.printf("[M33K WX] location ok (place=%s)\n",
+                  place.length() ? place.c_str() : "GPS");
+
+    // 3) Weather from Open-Meteo (HTTPS, no API key).
+    char url[384];
+    snprintf(url, sizeof(url),
+             "https://api.open-meteo.com/v1/forecast?latitude=%.4f&longitude=%.4f"
+             "&current=temperature_2m,weather_code,is_day,wind_speed_10m"
+             "&daily=temperature_2m_max,temperature_2m_min"
+             "&temperature_unit=fahrenheit&wind_speed_unit=mph"
+             "&timezone=auto&forecast_days=1",
+             lat, lon);
+
+    WiFiClientSecure secure;
+    secure.setInsecure();   // Open-Meteo is HTTPS; we don't pin a cert here.
+    HTTPClient https;
+    https.setConnectTimeout(6000);
+    https.setTimeout(7000);
+    String payload = "";
+    int httpCode = 0;
+    if (https.begin(secure, url)) {
+        httpCode = https.GET();
+        if (httpCode == 200) payload = https.getString();
+        https.end();
+    } else {
+        Serial.println("[M33K WX] https.begin failed");
+    }
+    Serial.printf("[M33K WX] open-meteo code=%d len=%d heap=%u\n",
+                  httpCode, (int)payload.length(), (unsigned)ESP.getFreeHeap());
+    if (payload.length() < 10) {
+        weatherState = WeatherState::Error;
+        if (weatherHaveData) applyWeatherToUi();
+        else if (weatherStatusLabel) lv_label_set_text(weatherStatusLabel, "Weather fetch failed");
+        return;
+    }
+
+    weatherTempF = weatherJsonNum(payload, "temperature_2m");
+    weatherCode  = (int)weatherJsonNum(payload, "weather_code");
+    weatherIsDay = weatherJsonNum(payload, "is_day") >= 0.5f;
+    weatherWindMph = weatherJsonNum(payload, "wind_speed_10m");
+    weatherHiF   = weatherJsonNum(payload, "temperature_2m_max");
+    weatherLoF   = weatherJsonNum(payload, "temperature_2m_min");
+    weatherPlace = place;   // "" when from GPS; that's fine
+    weatherLastFetchMs = millis();
+    weatherState = WeatherState::Ready;
+    weatherHaveData = true;
+
+    // Timestamp from the RTC for the "Updated" line, and persist to NVS so the
+    // reading survives a power-off.
+    {
+        RTC_DateTime d = instance.rtc.getDateTime();
+        uint8_t h = d.getHour(), dh = h;
+        if (!use24Hour) { dh = h % 12; if (dh == 0) dh = 12; }
+        char buf[24];
+        snprintf(buf, sizeof(buf), "%u/%u %u:%02u%s", d.getMonth(), d.getDay(),
+                 dh, d.getMinute(), use24Hour ? "" : (h < 12 ? "a" : "p"));
+        weatherUpdatedStr = buf;
+    }
+    saveWeatherCache();
+    applyWeatherToUi();
+
+    Serial.printf("[M33K WX] %d F  code=%d  hi=%d lo=%d\n",
+                  (int)lroundf(weatherTempF), weatherCode,
+                  (int)lroundf(weatherHiF), (int)lroundf(weatherLoF));
+}
+
+// Called from the main loop. Runs a pending fetch, and refreshes periodically
+// while the weather face is showing.
+void serviceWeatherFetch()
+{
+    if (currentPage != Page::Home || homeFaceIndex != 5 || screenSleeping) return;
+
+    if (weatherFetchPending) {
+        weatherFetchPending = false;
+        doWeatherFetch();
+        return;
+    }
+    if (weatherState == WeatherState::Ready &&
+        millis() - weatherLastFetchMs > WEATHER_REFRESH_MS) {
+        doWeatherFetch();
+    }
+}
+
+void buildWeatherFace()
+{
+    // Animated backdrop (storm/lightning <-> sunshine), colored each tick in
+    // faceAnimTick. Created first so everything else sits on top.
+    wxBg = lv_obj_create(screen);
+    lv_obj_remove_style_all(wxBg);
+    lv_obj_set_size(wxBg, 410, 502);
+    lv_obj_set_pos(wxBg, 0, 0);
+    lv_obj_set_style_bg_color(wxBg, lv_color_hex(0x0A1024), 0);
+    lv_obj_set_style_bg_grad_color(wxBg, lv_color_hex(0x05080F), 0);
+    lv_obj_set_style_bg_grad_dir(wxBg, LV_GRAD_DIR_VER, 0);
+    lv_obj_set_style_bg_opa(wxBg, LV_OPA_COVER, 0);
+
+    // Sun (hidden during the storm phase): glowing yellow disc, upper area.
+    wxSun = lv_obj_create(screen);
+    lv_obj_remove_style_all(wxSun);
+    lv_obj_set_size(wxSun, 74, 74);
+    lv_obj_align(wxSun, LV_ALIGN_TOP_RIGHT, -34, 132);  // upper-right, clear of text
+    lv_obj_set_style_radius(wxSun, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(wxSun, lv_color_hex(0xFFD23A), 0);
+    lv_obj_set_style_bg_opa(wxSun, LV_OPA_COVER, 0);
+    lv_obj_set_style_shadow_color(wxSun, lv_color_hex(0xFFC21A), 0);
+    lv_obj_set_style_shadow_width(wxSun, 40, 0);
+    lv_obj_set_style_shadow_spread(wxSun, 6, 0);
+    lv_obj_set_style_opa(wxSun, 0, 0);
+    lv_obj_clear_flag(wxSun, (lv_obj_flag_t)(LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE));
+
+    // Moon (clear night): a pale disc with a sky-coloured disc offset over it
+    // to carve a crescent. The carve matches the clear-night sky colour.
+    wxMoon = lv_obj_create(screen);
+    lv_obj_remove_style_all(wxMoon);
+    lv_obj_set_size(wxMoon, 60, 60);
+    lv_obj_align(wxMoon, LV_ALIGN_TOP_RIGHT, -40, 136);
+    lv_obj_set_style_radius(wxMoon, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(wxMoon, lv_color_hex(0xE8EEF7), 0);
+    lv_obj_set_style_bg_opa(wxMoon, LV_OPA_COVER, 0);
+    lv_obj_set_style_shadow_color(wxMoon, lv_color_hex(0xBFCBE0), 0);
+    lv_obj_set_style_shadow_width(wxMoon, 24, 0);
+    lv_obj_set_style_shadow_spread(wxMoon, 3, 0);
+    lv_obj_set_style_opa(wxMoon, 0, 0);
+    lv_obj_clear_flag(wxMoon, (lv_obj_flag_t)(LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE));
+    {
+        lv_obj_t *mc = lv_obj_create(wxMoon);
+        lv_obj_remove_style_all(mc);
+        lv_obj_set_size(mc, 52, 52);
+        lv_obj_set_pos(mc, 18, -4);
+        lv_obj_set_style_radius(mc, LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_bg_color(mc, lv_color_hex(0x0A1430), 0);
+        lv_obj_set_style_bg_opa(mc, LV_OPA_COVER, 0);
+        lv_obj_clear_flag(mc, (lv_obj_flag_t)(LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE));
+    }
+    // Stars (clear night): small dots scattered in the sky, twinkling.
+    static const uint16_t starX[WX_STAR_N] = { 26, 72, 118, 168, 214, 262, 310, 352, 388, 96 };
+    static const uint16_t starY[WX_STAR_N] = { 70, 150, 92, 196, 62, 168, 108, 210, 84, 262 };
+    for (int i = 0; i < WX_STAR_N; ++i) {
+        lv_obj_t *s = lv_obj_create(screen);
+        lv_obj_remove_style_all(s);
+        int sz = (i % 3 == 0) ? 4 : 3;
+        lv_obj_set_size(s, sz, sz);
+        lv_obj_set_pos(s, starX[i], starY[i]);
+        lv_obj_set_style_radius(s, LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_bg_color(s, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_set_style_bg_opa(s, LV_OPA_COVER, 0);
+        lv_obj_set_style_opa(s, 0, 0);
+        lv_obj_clear_flag(s, (lv_obj_flag_t)(LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE));
+        wxStars[i] = s;
+    }
+
+    // Fluffy clouds (sunny phase): each is a cluster of soft white blobs.
+    auto makeCloud = [&](int w, int h) -> lv_obj_t * {
+        lv_obj_t *cl = lv_obj_create(screen);
+        lv_obj_remove_style_all(cl);
+        lv_obj_set_size(cl, w, h);
+        lv_obj_clear_flag(cl, (lv_obj_flag_t)(LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE));
+        const int bw[4] = { h, (int)(h * 1.4f), (int)(h * 1.2f), h };
+        const int bx[4] = { 0, (int)(w * 0.22f), (int)(w * 0.5f), w - h };
+        for (int k = 0; k < 4; ++k) {
+            lv_obj_t *blob = lv_obj_create(cl);
+            lv_obj_remove_style_all(blob);
+            lv_obj_set_size(blob, bw[k], bw[k]);
+            lv_obj_set_pos(blob, bx[k], h - bw[k] + 2);
+            lv_obj_set_style_radius(blob, LV_RADIUS_CIRCLE, 0);
+            lv_obj_set_style_bg_color(blob, lv_color_hex(0xEEF3FF), 0);
+            lv_obj_set_style_bg_opa(blob, LV_OPA_COVER, 0);
+        }
+        lv_obj_set_style_opa(cl, 0, 0);
+        return cl;
+    };
+    // Kept in the sky band above the temperature so they never cross it.
+    wxCloud1 = makeCloud(62, 22);
+    wxCloud2 = makeCloud(46, 16);
+    wxCloud1X = 40;  lv_obj_set_pos(wxCloud1, (int)wxCloud1X, 126);
+    wxCloud2X = 236; lv_obj_set_pos(wxCloud2, (int)wxCloud2X, 132);
+
+    // Fog (fog phase): two wide soft grey bands drifting opposite ways, kept in
+    // the sky band so they don't wash over the temperature reading.
+    auto makeFog = [&](int y, int w, int h, uint32_t col) -> lv_obj_t * {
+        lv_obj_t *f = lv_obj_create(screen);
+        lv_obj_remove_style_all(f);
+        lv_obj_set_size(f, w, h);
+        lv_obj_set_pos(f, 0, y);
+        lv_obj_set_style_radius(f, h / 2, 0);
+        lv_obj_set_style_bg_color(f, lv_color_hex(col), 0);
+        lv_obj_set_style_bg_opa(f, LV_OPA_COVER, 0);
+        lv_obj_set_style_opa(f, 0, 0);
+        lv_obj_clear_flag(f, (lv_obj_flag_t)(LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE));
+        return f;
+    };
+    wxFog1 = makeFog(110, 330, 24, 0xC2CCD6);
+    wxFog2 = makeFog(134, 300, 20, 0xAEB9C6);
+    wxFog1X = -40; wxFog2X = 70;
+
+    // A small white bird gliding across the sky, wings flapping.
+    static lv_point_precise_t birdUp[5]   = { {0,9},{11,0},{22,9},{33,0},{44,9} };
+    wxBird = lv_line_create(screen);
+    lv_line_set_points(wxBird, birdUp, 5);
+    lv_obj_set_style_line_color(wxBird, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_line_width(wxBird, 3, 0);
+    lv_obj_set_style_line_rounded(wxBird, true, 0);
+    lv_obj_set_style_opa(wxBird, 0, 0);
+    wxBirdX = -50; wxBirdY = 118;
+    lv_obj_set_pos(wxBird, (int)wxBirdX, wxBirdY);
+
+    // Lightning bolt (hidden until a flash): a white zig-zag line.
+    static lv_point_precise_t boltPts[6] = {
+        {214, 120}, {190, 190}, {210, 190}, {184, 272}, {232, 182}, {210, 182}
+    };
+    wxBolt = lv_line_create(screen);
+    lv_line_set_points(wxBolt, boltPts, 6);
+    lv_obj_set_style_line_color(wxBolt, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_line_width(wxBolt, 5, 0);
+    lv_obj_set_style_line_rounded(wxBolt, true, 0);
+    lv_obj_set_style_opa(wxBolt, 0, 0);
+
+    // Full-screen flash overlay for the lightning strobe.
+    wxFlash = lv_obj_create(screen);
+    lv_obj_remove_style_all(wxFlash);
+    lv_obj_set_size(wxFlash, 410, 502);
+    lv_obj_set_pos(wxFlash, 0, 0);
+    lv_obj_set_style_bg_color(wxFlash, lv_color_hex(0xDDE8FF), 0);
+    lv_obj_set_style_bg_opa(wxFlash, 0, 0);
+    lv_obj_clear_flag(wxFlash, (lv_obj_flag_t)(LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE));
+
+    wxNextFlashMs = millis() + 600;
+    wxFlashUntil = 0;
+
+    // Mountain silhouette (sunny phase) along the bottom, above the dock.
+    wxMtn = lv_image_create(screen);
+    lv_image_set_src(wxMtn, &wx_mountains);
+    lv_obj_align(wxMtn, LV_ALIGN_BOTTOM_MID, 0, -88);  // above the dock
+    lv_obj_set_style_opa(wxMtn, 0, 0);
+    lv_obj_clear_flag(wxMtn, (lv_obj_flag_t)(LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE));
+
+    // City skyline (storm phase): dark buildings + a few lit windows.
+    wxCity = lv_obj_create(screen);
+    lv_obj_remove_style_all(wxCity);
+    lv_obj_set_size(wxCity, 410, 80);
+    lv_obj_align(wxCity, LV_ALIGN_BOTTOM_MID, 0, -74);  // above the dock
+    lv_obj_clear_flag(wxCity, (lv_obj_flag_t)(LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE));
+    static const uint8_t bH[12] = { 30, 54, 40, 68, 36, 60, 46, 72, 34, 56, 44, 64 };
+    for (int i = 0; i < 12; ++i) {
+        lv_obj_t *b = lv_obj_create(wxCity);
+        lv_obj_remove_style_all(b);
+        lv_obj_set_size(b, 30, bH[i]);
+        lv_obj_set_pos(b, 6 + i * 34, 80 - bH[i]);
+        lv_obj_set_style_bg_color(b, lv_color_hex(0x0E1526), 0);
+        lv_obj_set_style_bg_opa(b, LV_OPA_COVER, 0);
+        lv_obj_clear_flag(b, (lv_obj_flag_t)(LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE));
+        // Glowing vertical windows in a grid. Taller buildings get more rows
+        // of windows; short ones get just a couple.
+        if (i % 2 == 0) {
+            const int colX[2] = { 7, 19 };   // two columns of windows
+            const int wW = 4, wH = 7;         // vertical window
+            const int topY = 8, vgap = 13;
+            int rows = (bH[i] - topY - 4) / vgap;
+            if (rows < 1) rows = 1;
+            if (rows > 5) rows = 5;
+            for (int r = 0; r < rows; ++r) {
+                for (int c = 0; c < 2; ++c) {
+                    if (((r + c + i) % 3) == 0) continue;   // some windows dark
+                    lv_obj_t *win = lv_obj_create(b);
+                    lv_obj_remove_style_all(win);
+                    lv_obj_set_size(win, wW, wH);
+                    lv_obj_set_pos(win, colX[c], topY + r * vgap);
+                    lv_obj_set_style_radius(win, 1, 0);
+                    lv_obj_set_style_bg_color(win, lv_color_hex(0xFFF3D6), 0);
+                    lv_obj_set_style_bg_opa(win, LV_OPA_COVER, 0);
+                    lv_obj_set_style_shadow_color(win, lv_color_hex(0xFFE9B0), 0);
+                    lv_obj_set_style_shadow_width(win, 5, 0);
+                    lv_obj_set_style_shadow_opa(win, 160, 0);
+                }
+            }
+        }
+    }
+    lv_obj_set_style_opa(wxCity, 0, 0);
+
+    // Rain streaks (rain/storm): thin pale-blue drops falling, tilted by wind.
+    for (int i = 0; i < WX_RAIN_N; ++i) {
+        lv_obj_t *d = lv_obj_create(screen);
+        lv_obj_remove_style_all(d);
+        lv_obj_set_size(d, 2, 12);
+        lv_obj_set_style_radius(d, 1, 0);
+        lv_obj_set_style_bg_color(d, lv_color_hex(0xBFE0FF), 0);
+        lv_obj_set_style_bg_opa(d, LV_OPA_COVER, 0);
+        lv_obj_set_style_opa(d, 0, 0);
+        lv_obj_clear_flag(d, (lv_obj_flag_t)(LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE));
+        wxRainX[i]   = rand() % 410;
+        wxRainY[i]   = rand() % 502;
+        wxRainSpd[i] = 9.0f + (rand() % 100) / 18.0f;   // ~9..14.5 px/tick
+        lv_obj_set_pos(d, (int)wxRainX[i], (int)wxRainY[i]);
+        wxRain[i] = d;
+    }
+    // Snowflakes (snow): small white discs drifting down with a sideways sway.
+    for (int i = 0; i < WX_SNOW_N; ++i) {
+        lv_obj_t *s = lv_obj_create(screen);
+        lv_obj_remove_style_all(s);
+        int sz = 4 + (rand() % 3);   // 4..6 px
+        lv_obj_set_size(s, sz, sz);
+        lv_obj_set_style_radius(s, LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_bg_color(s, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_set_style_bg_opa(s, LV_OPA_COVER, 0);
+        lv_obj_set_style_opa(s, 0, 0);
+        lv_obj_clear_flag(s, (lv_obj_flag_t)(LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE));
+        wxSnowX[i]   = rand() % 410;
+        wxSnowY[i]   = rand() % 502;
+        wxSnowSpd[i] = 1.6f + (rand() % 100) / 55.0f;   // ~1.6..3.4 px/tick
+        wxSnowPh[i]  = (rand() % 628) / 100.0f;
+        lv_obj_set_pos(s, (int)wxSnowX[i], (int)wxSnowY[i]);
+        wxSnow[i] = s;
+    }
+
+    createTopBar();
+
+    // Clock across the top; the date line is replaced by the week strip below.
+    buildFaceClock(36);
+    if (faceClockDate) lv_obj_add_flag(faceClockDate, LV_OBJ_FLAG_HIDDEN);
+
+    // Day-of-week strip: all seven days, the current one lit with its date.
+    RTC_DateTime wdt = instance.rtc.getDateTime();
+    struct tm wtm = wdt.toUnixTime();
+    int wd = wtm.tm_wday; if (wd < 0 || wd > 6) wd = 0;
+    static const char *DOW[7] = { "S", "M", "T", "W", "T", "F", "S" };
+    for (int i = 0; i < 7; ++i) {
+        lv_obj_t *c = lv_label_create(screen);
+        lv_label_set_text(c, DOW[i]);
+        lv_obj_set_style_text_font(c, &lv_font_montserrat_16, 0);
+        const bool cur = (i == wd);
+        lv_obj_set_style_text_color(c, lv_color_hex(cur ? 0x0A1024 : 0x5E7290), 0);
+        if (cur) {
+            lv_obj_set_style_bg_color(c, lv_color_hex(0x3AEFFF), 0);
+            lv_obj_set_style_bg_opa(c, LV_OPA_COVER, 0);
+            lv_obj_set_style_radius(c, LV_RADIUS_CIRCLE, 0);
+            lv_obj_set_style_pad_all(c, 5, 0);
+        }
+        lv_obj_align(c, LV_ALIGN_TOP_MID, (i - 3) * 44, cur ? 94 : 98);
+        weekCells[i] = c;
+    }
+    weekDateLabel = lv_label_create(screen);
+    lv_label_set_text_fmt(weekDateLabel, "%u", wdt.getDay());
+    lv_obj_set_style_text_font(weekDateLabel, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(weekDateLabel, lv_color_hex(0x3AEFFF), 0);
+    lv_obj_align(weekDateLabel, LV_ALIGN_TOP_MID, (wd - 3) * 44, 124);
+
+    weatherTempLabel = lv_label_create(screen);
+    lv_label_set_text(weatherTempLabel, "--\xC2\xB0");
+    lv_obj_set_style_text_font(weatherTempLabel, &lv_font_montserrat_44, 0);
+    lv_obj_set_style_text_color(weatherTempLabel, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_align(weatherTempLabel, LV_ALIGN_TOP_MID, 0, 152);
+
+    weatherCondLabel = lv_label_create(screen);
+    lv_label_set_text(weatherCondLabel, "");
+    lv_obj_set_style_text_font(weatherCondLabel, &lv_font_montserrat_28, 0);
+    lv_obj_set_style_text_color(weatherCondLabel, lv_color_hex(0xCFE8FF), 0);
+    lv_obj_align(weatherCondLabel, LV_ALIGN_TOP_MID, 0, 210);
+
+    weatherHiLoLabel = lv_label_create(screen);
+    lv_label_set_text(weatherHiLoLabel, "");
+    lv_obj_set_style_text_font(weatherHiLoLabel, &lv_font_montserrat_22, 0);
+    lv_obj_set_style_text_color(weatherHiLoLabel, lv_color_hex(0x9FD0FF), 0);
+    lv_obj_align(weatherHiLoLabel, LV_ALIGN_TOP_MID, 0, 250);
+
+    weatherPlaceLabel = lv_label_create(screen);
+    lv_label_set_text(weatherPlaceLabel, "");
+    lv_obj_set_style_text_font(weatherPlaceLabel, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(weatherPlaceLabel, lv_color_hex(0xCFE8FF), 0);
+    lv_obj_align(weatherPlaceLabel, LV_ALIGN_TOP_MID, 0, 286);
+
+    weatherStatusLabel = lv_label_create(screen);
+    lv_label_set_text(weatherStatusLabel, "Updating weather...");
+    lv_obj_set_style_text_font(weatherStatusLabel, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(weatherStatusLabel, lv_color_hex(0x7FA8D8), 0);
+    lv_obj_align(weatherStatusLabel, LV_ALIGN_TOP_MID, 0, 312);
+
+    // Load the saved reading on a cold boot so the face isn't blank offline.
+    if (!weatherHaveData) loadWeatherCache();
+
+    // Show whatever we already have (fresh or cached), then refresh if stale.
+    applyWeatherToUi();
+    if (weatherState == WeatherState::Ready) {
+        if (millis() - weatherLastFetchMs > WEATHER_REFRESH_MS) weatherFetchPending = true;
+    } else {
+        weatherFetchPending = true;   // try to update (shows cache meanwhile)
+    }
+}
+
+// Home face swipe, serviced from the main loop. Reads the touch input device
+// state directly (via LVGL's cached point), so it does not depend on LVGL
+// event routing / object z-order, which was swallowing the swipe before.
+// Reads the touch controller directly (same source and coordinate space as
+// the LVGL display driver's touchpad_read). We deliberately do NOT go through
+// lv_indev_get_next(): this board registers touch, encoder and keypad input
+// devices, and LVGL inserts them head-first, so the first indev is not the
+// touchpad. Polling the hardware removes that ambiguity entirely.
+void serviceFaceSwipe()
+{
+    if (currentPage != Page::Home || screenSleeping) {
+        swipeTracking = false;
+        swipeLostMs = 0;
+        return;
+    }
+
+    int16_t tx = 0, ty = 0;
+    bool touched = instance.getPoint(&tx, &ty, 1) > 0;
+
+    if (touched) {
+        if (!swipeTracking) {
+            swipeTracking = true;
+            swipeStartX = tx;
+            swipeStartY = ty;
+            swipeStartMs = millis();
+        }
+        // Remember the most recent in-contact point; the release poll reports
+        // no coordinates, so we measure the swipe from the last point down.
+        swipeLastX = tx;
+        swipeLastY = ty;
+        swipeLostMs = 0;   // touch present again: cancel any pending release
+        return;
+    }
+
+    // No touch this poll.
+    if (!swipeTracking) return;
+
+    // Debounce brief gaps in the touch stream. The controller routinely drops
+    // a frame or two mid-drag, which would otherwise look like a finger lift
+    // and chop one slow swipe into many tiny fragments. Only finalize once the
+    // touch has been continuously absent for the grace period.
+    if (swipeLostMs == 0) { swipeLostMs = millis(); return; }
+    if (millis() - swipeLostMs < 90) return;
+
+    swipeTracking = false;
+    swipeLostMs = 0;
+
+    const int dx = swipeLastX - swipeStartX;
+    const int dy = swipeLastY - swipeStartY;
+    const uint32_t dt = millis() - swipeStartMs;
+    const bool ok = (dt < 2000 && abs(dx) > 40 && abs(dx) > abs(dy) &&
+                     millis() - lastFaceSwitchMs > 450);
+    if (ok) {
+        homeFaceIndex = (dx < 0)
+            ? (homeFaceIndex + 1) % HOME_FACE_COUNT
+            : (homeFaceIndex + HOME_FACE_COUNT - 1) % HOME_FACE_COUNT;
+        lastFaceSwitchMs = millis();
+        saveHomeFace();
+        hapticTap();
+        showHome();
     }
 }
 
@@ -10555,17 +13527,76 @@ void showHome()
     clearScreen();
     currentPage = Page::Home;
 
-    createMatrixBackground();
-    createArt();
-    createTopBar();
-    createTimeDate();
+    // Alternate-face objects are rebuilt each time; clear stale pointers.
+    faceClockHour = faceClockColon = faceClockMin = faceClockDate = nullptr;
+    termTime = termDate = termBatt = termCursor = nullptr;
+    crewMain = crewCatBody = crewCatTail = crewMonBody = crewMonTail = nullptr;
+    videoImg = nullptr;
+    radarFaceImg = radarEyeL = radarEyeR = nullptr;
+    radarEyeLGlow = radarEyeRGlow = nullptr;
+    radarVTime = radarVMeta = radarCenterTxt = nullptr;
+    radarMetaDay = radarMetaDate = nullptr;
+    for (int i = 0; i < 4; ++i) radarRing[i] = radarRingGlow[i] = nullptr;
+    for (int i = 0; i < 4; ++i) for (int j = 0; j < 7; ++j) radarSeg[i][j] = nullptr;
+    for (int i = 0; i < BUBBLE_COUNT; ++i) {
+        gBubbles[i].obj = gBubbles[i].glowL = gBubbles[i].glowR = nullptr;
+    }
+    for (int i = 0; i < BG_BUBBLE_COUNT; ++i) gBgBubbles[i].obj = nullptr;
+    weatherTempLabel = weatherCondLabel = weatherHiLoLabel = nullptr;
+    weatherPlaceLabel = weatherStatusLabel = weatherIcon = nullptr;
+    wxBg = wxFlash = wxSun = wxBolt = nullptr;
+    wxMtn = wxCity = weekDateLabel = nullptr;
+    wxCloud1 = wxCloud2 = wxBird = nullptr;
+    wxMoon = wxFog1 = wxFog2 = nullptr;
+    for (int i = 0; i < WX_STAR_N; ++i) wxStars[i] = nullptr;
+    for (int i = 0; i < WX_RAIN_N; ++i) wxRain[i] = nullptr;
+    for (int i = 0; i < WX_SNOW_N; ++i) wxSnow[i] = nullptr;
+    for (int i = 0; i < 7; ++i) weekCells[i] = nullptr;
+    weatherFetchPending = false;
+
+    // Reset matrix-rain tuning to the default (faces override as needed).
+    matrixColA = 0x3AEFFF;
+    matrixColB = 0xFF4AD5;
+    matrixDriftX = 0;
+    matrixSkullRecolor = 0;
+    dockIconColorOverride = 0;
+
+    // (Swipe-to-switch is serviced from the main loop; see serviceFaceSwipe.)
+
+    if (homeFaceIndex == 1) {
+        buildTerminalFace();
+    } else if (homeFaceIndex == 2) {
+        buildCrewFace();
+    } else if (homeFaceIndex == 3) {
+        buildVideoFace();
+    } else if (homeFaceIndex == 4) {
+        buildBubblesFace();
+    } else if (homeFaceIndex == 5) {
+        buildWeatherFace();
+    } else if (homeFaceIndex == 6) {
+        buildRadarFace();
+    } else {
+        // Original face, unchanged.
+        createMatrixBackground();
+        createArt();
+        createTopBar();
+        createTimeDate();
+    }
+
     createDock();
 
     updateHomeLiveData();
+    updateFaceClock();
     homeLiveTimer = lv_timer_create(homeLiveTimerCb, 1000, nullptr);
 
+    faceAnimStartMs = millis();
+    if (homeFaceIndex != 0) {
+        // 33 ms (~30 fps) so motion steps are small and smooth, not choppy.
+        faceAnimTimer = lv_timer_create(faceAnimTick, 33, nullptr);
+    }
+
     noteActivity();
-    Serial.println("[M33K] Home");
+    Serial.printf("[M33K] Home (face %u)\n", homeFaceIndex);
 }
 
 // -----------------------------------------------------------------------------
@@ -11717,6 +14748,26 @@ void wifiRefreshEvent(lv_event_t *e)
     beginWifiScan();
 }
 
+// m33k t3ch ambles across the Wi-Fi page, cycling through six action poses
+// (idle, dash, turn, orb, blast, leap) - a livelier, different animation from
+// the two-frame run cycle used in the game.
+void wifiMascotCb(lv_timer_t *timer)
+{
+    LV_UNUSED(timer);
+    if (currentPage != Page::WiFi || !wifiMascot) return;
+    const uint32_t now = millis();
+    // Drift back and forth across the page.
+    if (wifiMascotDir > 0) { wifiMascotX += 4; if (wifiMascotX > 300) wifiMascotDir = -1; }
+    else                   { wifiMascotX -= 4; if (wifiMascotX < 10)  wifiMascotDir = 1;  }
+    const int bob = (int)(sinf(now * 0.010f) * 6.0f);
+    lv_obj_set_pos(wifiMascot, wifiMascotX, 286 + bob);
+    // Step through all six poses at a relaxed cadence (distinct from the game).
+    if (now - wifiMascotAnimMs > 190) {
+        wifiMascotAnimMs = now;
+        wifiMascotFrame = (wifiMascotFrame + 1) % 6;
+        lv_image_set_src(wifiMascot, g_wifi[wifiMascotFrame]);
+    }
+}
 
 void showWifiPage()
 {
@@ -11740,7 +14791,7 @@ void showWifiPage()
     lv_obj_set_pos(glowOuter, 110, 190);
     lv_obj_set_style_radius(glowOuter, 150, 0);
     lv_obj_set_style_bg_color(glowOuter, lv_color_hex(0x075CFF), 0);
-    lv_obj_set_style_bg_opa(glowOuter, 18, 0);
+    lv_obj_set_style_bg_opa(glowOuter, 14, 0);
 
     lv_obj_t *glowMid = lv_obj_create(screen);
     lv_obj_remove_style_all(glowMid);
@@ -11748,7 +14799,7 @@ void showWifiPage()
     lv_obj_set_pos(glowMid, 165, 220);
     lv_obj_set_style_radius(glowMid, 130, 0);
     lv_obj_set_style_bg_color(glowMid, lv_color_hex(0x008CFF), 0);
-    lv_obj_set_style_bg_opa(glowMid, 28, 0);
+    lv_obj_set_style_bg_opa(glowMid, 20, 0);
 
     lv_obj_t *glowCore = lv_obj_create(screen);
     lv_obj_remove_style_all(glowCore);
@@ -11756,11 +14807,16 @@ void showWifiPage()
     lv_obj_set_pos(glowCore, 212, 248);
     lv_obj_set_style_radius(glowCore, 110, 0);
     lv_obj_set_style_bg_color(glowCore, lv_color_hex(0x22C8FF), 0);
-    lv_obj_set_style_bg_opa(glowCore, 38, 0);
+    lv_obj_set_style_bg_opa(glowCore, 26, 0);
 
-    lv_obj_t *wifiArt = lv_image_create(screen);
-    lv_image_set_src(wifiArt, &wifi_bunny_bg_img);
-    lv_obj_set_pos(wifiArt, 224, 304);
+    // m33k t3ch paces across the page (bigger, 4-pose animation), in place of
+    // the static bunny.
+    wifiMascot = lv_image_create(screen);
+    lv_image_set_src(wifiMascot, g_wifi[0]);
+    wifiMascotX = 20; wifiMascotDir = 1; wifiMascotFrame = 0; wifiMascotAnimMs = millis();
+    lv_obj_set_pos(wifiMascot, wifiMascotX, 286);
+    lv_obj_clear_flag(wifiMascot, LV_OBJ_FLAG_CLICKABLE);
+    wifiMascotTimer = lv_timer_create(wifiMascotCb, 60, nullptr);
 
     // A very light black veil keeps scan rows readable without hiding the art.
     lv_obj_t *shade = lv_obj_create(screen);
@@ -12134,10 +15190,25 @@ void scanConnectNetworksEvent(lv_event_t *e)
 
     setSettingsStatus("Scanning nearby Wi-Fi...");
 
+    // Fully reset the radio before scanning. Scanning while the STA driver is
+    // mid-connect (auto-connect/weather retrying a network that isn't in
+    // range) triggers "cannot stop scan process" and a LoadProhibited crash.
+    // A plain disconnect isn't enough because ESP32 auto-reconnects straight
+    // back into "connecting", so disable auto-reconnect, stop any scan, take
+    // the radio down, then bring STA back up clean and scan.
+    const bool wasConnected = (WiFi.status() == WL_CONNECTED);
+    WiFi.setAutoReconnect(false);
+    esp_wifi_scan_stop();
+    WiFi.disconnect(true, false);      // stop connecting + radio off
+    delay(200);
     WiFi.mode(WIFI_STA);
+    delay(150);
     WiFi.scanDelete();
 
     int16_t count = WiFi.scanNetworks(false, true, true, 250);
+
+    // Restore auto-reconnect only if we were deliberately connected before.
+    WiFi.setAutoReconnect(wasConnected);
 
     availableSsidCount = 0;
     String options;
@@ -13876,6 +16947,12 @@ void renderBleResults()
         lv_label_set_text(none, "No BLE advertisements detected.");
         lv_obj_set_style_text_color(none, lv_color_hex(0xD6E0EE), 0);
         lv_obj_set_style_text_font(none, &lv_font_montserrat_14, 0);
+        // Chip background so the text stays readable over the character.
+        lv_obj_set_style_bg_color(none, lv_color_hex(0x07101D), 0);
+        lv_obj_set_style_bg_opa(none, 170, 0);
+        lv_obj_set_style_radius(none, 9, 0);
+        lv_obj_set_style_pad_hor(none, 8, 0);
+        lv_obj_set_style_pad_ver(none, 5, 0);
         return;
     }
 
@@ -13993,21 +17070,147 @@ void bleRefreshEvent(lv_event_t *e)
 }
 
 
+// ---------------------------------------------------------------------------
+// BLE page character animation.
+//
+// A scaled m33k t3ch sprite loops through idle -> look -> BLE ping -> walk ->
+// scan-hit -> glare, drawn behind the (transparent) device list so device rows
+// read as chips over him. Serviced by a lightweight lv_timer; torn down in
+// clearPageTimers() when the page is left.
+// ---------------------------------------------------------------------------
+static const lv_image_dsc_t *const BLE_WALK[] = {
+    &m_ble_w0, &m_ble_w1, &m_ble_w2, &m_ble_w3, &m_ble_w4, &m_ble_w5
+};
+
+struct BleAnimStepDef { const lv_image_dsc_t *img; bool walk; uint32_t dur; bool ping; };
+static const BleAnimStepDef BLE_SEQ[] = {
+    { &m_ble_idle0, false, 700,  false },
+    { &m_ble_look,  false, 500,  false },
+    { &m_ble_ping,  false, 1000, true  },
+    { nullptr,      true,  1300, false },
+    { &m_ble_point, false, 800,  false },
+    { &m_ble_glare, false, 750,  false },
+};
+static const int BLE_SEQ_N = sizeof(BLE_SEQ) / sizeof(BLE_SEQ[0]);
+
+static void blePingExec(void *obj, int32_t v)
+{
+    lv_obj_t *r = static_cast<lv_obj_t *>(obj);
+    const int sz = 26 + (v * 250) / 100;
+    lv_obj_set_size(r, sz, sz);
+    lv_obj_set_pos(r, blePingCx - sz / 2, blePingCy - sz / 2);
+    lv_obj_set_style_radius(r, sz / 2, 0);
+    lv_obj_set_style_border_opa(
+        r, static_cast<lv_opa_t>(220 * (100 - v) / 100), 0);
+}
+
+static void bleFirePing()
+{
+    if (!blePingRing) return;
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, blePingRing);
+    lv_anim_set_exec_cb(&a, blePingExec);
+    lv_anim_set_values(&a, 0, 100);
+    lv_anim_set_time(&a, 1100);
+    lv_anim_start(&a);
+}
+
+static void bleApplyStep(int idx)
+{
+    const BleAnimStepDef &s = BLE_SEQ[idx];
+    if (s.walk) {
+        bleWalkSub = 0;
+        bleWalkSubStart = millis();
+        if (bleCat) lv_image_set_src(bleCat, BLE_WALK[0]);
+    } else if (bleCat) {
+        lv_image_set_src(bleCat, s.img);
+    }
+    if (s.ping) bleFirePing();
+}
+
+static void bleAnimTick(lv_timer_t *timer)
+{
+    LV_UNUSED(timer);
+    if (!bleCat || currentPage != Page::BLE) return;
+
+    const uint32_t now = millis();
+    const BleAnimStepDef &s = BLE_SEQ[bleAnimStep];
+
+    if (s.walk && (now - bleWalkSubStart >= 130)) {
+        bleWalkSubStart = now;
+        bleWalkSub = (bleWalkSub + 1) % 6;
+        lv_image_set_src(bleCat, BLE_WALK[bleWalkSub]);
+    }
+
+    if (now - bleAnimStepStart >= s.dur) {
+        bleAnimStep = (bleAnimStep + 1) % BLE_SEQ_N;
+        bleAnimStepStart = now;
+        bleApplyStep(bleAnimStep);
+    }
+}
+
 void showBlePage()
 {
     clearScreen();
     currentPage = Page::BLE;
 
-    lv_obj_t *bg = lv_image_create(screen);
-    lv_image_set_src(bg, &ble_bunny_bg_img);
+    // Dark BLE backdrop (replaces the old bunny background image).
+    lv_obj_t *bg = lv_obj_create(screen);
+    lv_obj_remove_style_all(bg);
+    lv_obj_set_size(bg, 410, 502);
     lv_obj_set_pos(bg, 0, 0);
+    lv_obj_set_style_bg_color(bg, lv_color_hex(0x0B1430), 0);
+    lv_obj_set_style_bg_grad_color(bg, lv_color_hex(0x05030C), 0);
+    lv_obj_set_style_bg_grad_dir(bg, LV_GRAD_DIR_VER, 0);
+    lv_obj_set_style_bg_opa(bg, LV_OPA_COVER, 0);
+
+    // Faint scanner range rings centered behind the character.
+    for (int ri = 0; ri < 3; ++ri) {
+        lv_obj_t *ring = lv_obj_create(screen);
+        lv_obj_remove_style_all(ring);
+        const int rs = 150 + ri * 90;
+        lv_obj_set_size(ring, rs, rs);
+        lv_obj_set_pos(ring, 205 - rs / 2, 300 - rs / 2);
+        lv_obj_set_style_radius(ring, rs / 2, 0);
+        lv_obj_set_style_bg_opa(ring, 0, 0);
+        lv_obj_set_style_border_width(ring, 1, 0);
+        lv_obj_set_style_border_color(ring, lv_color_hex(0x1C3A6B), 0);
+        lv_obj_clear_flag(ring, LV_OBJ_FLAG_CLICKABLE);
+    }
 
     lv_obj_t *shade = lv_obj_create(screen);
     lv_obj_remove_style_all(shade);
     lv_obj_set_size(shade, 410, 502);
     lv_obj_set_pos(shade, 0, 0);
     lv_obj_set_style_bg_color(shade, lv_color_hex(0x02050B), 0);
-    lv_obj_set_style_bg_opa(shade, 55, 0);
+    lv_obj_set_style_bg_opa(shade, 40, 0);
+
+    // Expanding BLE "ping" ring, animated on the ping step (behind the cat).
+    blePingCx = 205;
+    blePingCy = 300;
+    blePingRing = lv_obj_create(screen);
+    lv_obj_remove_style_all(blePingRing);
+    lv_obj_set_size(blePingRing, 26, 26);
+    lv_obj_set_pos(blePingRing, blePingCx - 13, blePingCy - 13);
+    lv_obj_set_style_radius(blePingRing, 13, 0);
+    lv_obj_set_style_bg_opa(blePingRing, 0, 0);
+    lv_obj_set_style_border_width(blePingRing, 3, 0);
+    lv_obj_set_style_border_color(blePingRing, lv_color_hex(0x37E3FF), 0);
+    lv_obj_set_style_border_opa(blePingRing, 0, 0);
+    lv_obj_clear_flag(blePingRing, LV_OBJ_FLAG_CLICKABLE);
+
+    // Animated character.
+    bleCat = lv_image_create(screen);
+    lv_image_set_src(bleCat, &m_ble_idle0);
+    lv_obj_align(bleCat, LV_ALIGN_CENTER, 0, 58);
+    lv_obj_clear_flag(bleCat, LV_OBJ_FLAG_CLICKABLE);
+
+    bleAnimStep = 0;
+    bleAnimStepStart = millis();
+    bleWalkSub = 0;
+    bleWalkSubStart = millis();
+    bleAnimTimer = lv_timer_create(bleAnimTick, 60, nullptr);
 
     createPageBatteryIndicator();
 
@@ -14073,10 +17276,10 @@ void showBlePage()
     bleList = lv_obj_create(screen);
     lv_obj_set_size(bleList, 350, 350);
     lv_obj_set_pos(bleList, 30, 116);
-    lv_obj_set_style_bg_color(bleList, lv_color_hex(0x030711), 0);
-    lv_obj_set_style_bg_opa(bleList, 102, 0);
-    lv_obj_set_style_border_width(bleList, 1, 0);
-    lv_obj_set_style_border_color(bleList, lv_color_hex(0x213A64), 0);
+    // Transparent container so the animated character shows through the gaps;
+    // each device row carries its own chip background for readability.
+    lv_obj_set_style_bg_opa(bleList, 0, 0);
+    lv_obj_set_style_border_width(bleList, 0, 0);
     lv_obj_set_style_radius(bleList, 16, 0);
     lv_obj_set_style_pad_all(bleList, 8, 0);
     lv_obj_set_style_pad_row(bleList, 7, 0);
@@ -14986,8 +18189,8 @@ void showRadioPage()
     lv_obj_set_pos(radioPayloadLabel, 0, 0);
 
     lv_obj_t *sfBtn = lv_button_create(monitorCard);
-    lv_obj_set_size(sfBtn, 92, 34);
-    lv_obj_set_pos(sfBtn, 12, 200);
+    lv_obj_set_size(sfBtn, 78, 34);
+    lv_obj_set_pos(sfBtn, 8, 200);
     lv_obj_set_style_radius(sfBtn, 12, 0);
     lv_obj_set_style_bg_color(sfBtn, lv_color_hex(0x081826), 0);
     lv_obj_set_style_border_width(sfBtn, 1, 0);
@@ -15001,8 +18204,8 @@ void showRadioPage()
     lv_obj_center(radioSfButtonLabel);
 
     lv_obj_t *bwBtn = lv_button_create(monitorCard);
-    lv_obj_set_size(bwBtn, 104, 34);
-    lv_obj_set_pos(bwBtn, 122, 200);
+    lv_obj_set_size(bwBtn, 86, 34);
+    lv_obj_set_pos(bwBtn, 90, 200);
     lv_obj_set_style_radius(bwBtn, 12, 0);
     lv_obj_set_style_bg_color(bwBtn, lv_color_hex(0x10091D), 0);
     lv_obj_set_style_border_width(bwBtn, 1, 0);
@@ -15016,8 +18219,8 @@ void showRadioPage()
     lv_obj_center(radioBwButtonLabel);
 
     lv_obj_t *autoBtn = lv_button_create(monitorCard);
-    lv_obj_set_size(autoBtn, 100, 34);
-    lv_obj_set_pos(autoBtn, 238, 200);
+    lv_obj_set_size(autoBtn, 78, 34);
+    lv_obj_set_pos(autoBtn, 180, 200);
     lv_obj_set_style_radius(autoBtn, 12, 0);
     lv_obj_set_style_bg_color(autoBtn, lv_color_hex(0x0B1A1C), 0);
     lv_obj_set_style_border_width(autoBtn, 1, 0);
@@ -15029,6 +18232,22 @@ void showRadioPage()
     lv_obj_set_style_text_color(radioAutoButtonLabel, lv_color_hex(0x7CFF45), 0);
     lv_obj_set_style_text_font(radioAutoButtonLabel, &lv_font_montserrat_12, 0);
     lv_obj_center(radioAutoButtonLabel);
+
+    // MeshCore Listen preset toggle (forces 910.525 MHz / SF7 / BW62.5 / CR4:5).
+    lv_obj_t *meshBtn = lv_button_create(monitorCard);
+    lv_obj_set_size(meshBtn, 80, 34);
+    lv_obj_set_pos(meshBtn, 262, 200);
+    lv_obj_set_style_radius(meshBtn, 12, 0);
+    lv_obj_set_style_bg_color(meshBtn, lv_color_hex(0x1C1408), 0);
+    lv_obj_set_style_border_width(meshBtn, 1, 0);
+    lv_obj_set_style_border_color(meshBtn, lv_color_hex(0xFFB347), 0);
+    lv_obj_add_event_cb(meshBtn, radioMeshEvent, LV_EVENT_CLICKED, nullptr);
+
+    radioMeshButtonLabel = lv_label_create(meshBtn);
+    lv_label_set_text(radioMeshButtonLabel, "MESH OFF");
+    lv_obj_set_style_text_color(radioMeshButtonLabel, lv_color_hex(0xFFB347), 0);
+    lv_obj_set_style_text_font(radioMeshButtonLabel, &lv_font_montserrat_12, 0);
+    lv_obj_center(radioMeshButtonLabel);
 
     lv_obj_t *reprobeBtn = lv_button_create(screen);
     lv_obj_set_size(reprobeBtn, 150, 46);
@@ -15071,6 +18290,7 @@ void showRadioPage()
     m33kRadioSfIndex = 2;
     m33kRadioBwIndex = 0;
     m33kRadioAutoScan = false;
+    m33kRadioMeshCore = false;
     m33kRadioNextProfileMs = 0;
 
     resetRadioHistory();
@@ -17387,7 +20607,7 @@ void updateMapUi()
         if (mapMarkerLabel) {
             lv_label_set_text(
                 mapMarkerLabel,
-                haveFix ? "YOU" : "TEST"
+                "YOU"
             );
             lv_obj_set_pos(
                 mapMarkerLabel,
@@ -17875,20 +21095,9 @@ void showGpsPage()
     );
     lv_obj_set_pos(gpsDataLabel, 12, 44);
 
-    lv_obj_t *mapBtn = lv_button_create(screen);
-    lv_obj_set_size(mapBtn, 64, 42);
-    lv_obj_set_pos(mapBtn, 316, 17);
-    lv_obj_set_style_radius(mapBtn, 13, 0);
-    lv_obj_set_style_bg_color(mapBtn, lv_color_hex(0x081826), 0);
-    lv_obj_set_style_border_width(mapBtn, 1, 0);
-    lv_obj_set_style_border_color(mapBtn, lv_color_hex(0x55EEFF), 0);
-    lv_obj_add_event_cb(mapBtn, mapOpenEvent, LV_EVENT_CLICKED, nullptr);
-
-    lv_obj_t *mapBtnText = lv_label_create(mapBtn);
-    lv_label_set_text(mapBtnText, "MAP");
-    lv_obj_set_style_text_color(mapBtnText, lv_color_hex(0x55EEFF), 0);
-    lv_obj_set_style_text_font(mapBtnText, &lv_font_montserrat_14, 0);
-    lv_obj_center(mapBtnText);
+    // Offline map is hidden for now: the "MAP" launch button is not created, so
+    // the map page is unreachable from the UI. The map code remains dormant and
+    // can be restored (or fully removed) later. (mapOpenEvent/showMapPage unused.)
 
     gpsTimer = lv_timer_create(gpsTimerCb, 500, nullptr);
     lv_timer_ready(gpsTimer);
@@ -18817,7 +22026,33 @@ void loop()
         sleepScreen();
     }
 
+    // Deep-idle GNSS shed: once the watch has been idle well past the screen
+    // timeout and is not in a background Wardrive capture, power the GNSS rail
+    // down to save battery. wakeScreen() restores it on the next wake.
+    //
+    // BUT never shed while the user is on a GPS-consuming page: the screen
+    // sleeps after ~30 s on a drive, and cutting GPS power 3 min later meant
+    // the module never stayed on long enough to acquire a fix (every wake was
+    // a cold restart). Keep it powered so it can lock and hold while tracking.
+    const bool onGpsPage =
+        (currentPage == Page::GPS || currentPage == Page::Map ||
+         currentPage == Page::Recon || currentPage == Page::Wardrive);
+    if (screenSleeping && gpsToolActive && !gpsDeepIdleOff && !wardriveRunning &&
+        !onGpsPage &&
+        (millis() - lastActivityMs >= GPS_DEEP_IDLE_MS)) {
+        instance.powerControl(POWER_GPS, false);
+        gpsToolActive = false;
+        gpsDeepIdleOff = true;
+        Serial.println("[M33K POWER] Deep idle: GNSS rail powered down");
+    }
+
     lv_timer_handler();
+
+    // Home face swipe-to-switch (reads the touch indev directly).
+    serviceFaceSwipe();
+
+    // Weather face: run a pending/periodic fetch off the LVGL task.
+    serviceWeatherFetch();
 
     // Match LilyGO's official NFC Reader loop cadence: one RFAL worker call
     // before LVGL, then a 5 ms loop delay. Avoid double-driving the state machine.
