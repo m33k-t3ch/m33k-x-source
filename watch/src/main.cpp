@@ -677,11 +677,6 @@ double mapRequestedLon = 0.0;
 bool mapTileReloadPending = false;
 bool mapTileLoaded = false;
 
-// Private development fallback so offline tile loading can be tested indoors.
-// A real fresh GPS fix always overrides this. Remove before public release.
-constexpr bool MAP_DEV_TEST_LOCATION_ENABLED = true;
-constexpr double MAP_DEV_TEST_LAT = 47.6205;
-constexpr double MAP_DEV_TEST_LON = -122.3493;
 
 uint8_t mapZoomLevel = 16;
 bool mapOpenPending = false;
@@ -17339,14 +17334,9 @@ void updateMapUi()
         }
     }
 
-    const bool useTestLocation =
-        !haveFix && MAP_DEV_TEST_LOCATION_ENABLED;
-
-    if (haveFix || useTestLocation) {
-        const double mapLat =
-            haveFix ? gpsParser.location.lat() : MAP_DEV_TEST_LAT;
-        const double mapLon =
-            haveFix ? gpsParser.location.lng() : MAP_DEV_TEST_LON;
+    if (haveFix) {
+        const double mapLat = gpsParser.location.lat();
+        const double mapLon = gpsParser.location.lng();
 
         int32_t tileX = -1;
         int32_t tileY = -1;
@@ -17407,26 +17397,6 @@ void updateMapUi()
             lv_obj_remove_flag(mapMarkerLabel, LV_OBJ_FLAG_HIDDEN);
         }
 
-        if (useTestLocation && mapStatusLabel) {
-            lv_label_set_text(
-                mapStatusLabel,
-                "TEST LOCATION  |  NO GPS FIX"
-            );
-            lv_obj_set_style_text_color(
-                mapStatusLabel,
-                lv_color_hex(0x55EEFF),
-                0
-            );
-        }
-
-        if (useTestLocation && mapCoordLabel) {
-            lv_label_set_text_fmt(
-                mapCoordLabel,
-                "TEST LAT %.6f\nTEST LON %.6f",
-                mapLat,
-                mapLon
-            );
-        }
     } else {
         if (mapMarkerDot) {
             lv_obj_add_flag(mapMarkerDot, LV_OBJ_FLAG_HIDDEN);
