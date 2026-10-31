@@ -19,7 +19,6 @@ The Watch firmware is distributed through the [M33K X Web Flasher](https://m33k-
 - Map dev-test location fallback (a hardcoded placeholder coordinate) — the offline map now uses only a real GPS fix.
 
 ### Notes
-- The offline map is temporarily hidden from the UI.
 - NFC remains experimental and is disabled in the public build.
 
 ## [0.6.0i] — 2026-10
