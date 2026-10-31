@@ -4,13 +4,13 @@ This repository contains the public source snapshot corresponding to the M33K X 
 
 ## Hardware
 
-- LilyGO T-Watch Ultra — ESP32-S3
+- LilyGO T-Watch Ultra â€” ESP32-S3
 - Seeed XIAO ESP32-C5 companion
 
 ## Source layout
 
-- `watch/` — M33K X Watch firmware
-- `c5/` — ESP32-C5 companion firmware
+- `watch/` â€” M33K X Watch firmware
+- `c5/` â€” ESP32-C5 companion firmware
 
 Both projects are built with PlatformIO.
 
@@ -18,8 +18,8 @@ Both projects are built with PlatformIO.
 
 Current public firmware:
 
-- M33K X Watch — v0.6.0h public beta
-- M33K X C5 — v0.1.3 public beta
+- M33K X Watch â€” v0.6.0h public beta
+- M33K X C5 â€” v0.1.3 public beta
 
 The C5 companion extends the Watch with 5 GHz Wi-Fi scanning and uses per-device Watch-to-C5 enrollment and authenticated reconnect.
 
